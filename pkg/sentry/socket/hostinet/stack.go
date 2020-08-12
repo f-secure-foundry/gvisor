@@ -25,13 +25,13 @@ import (
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 var defaultRecvBufSize = inet.TCPBufferSize{
@@ -53,6 +53,7 @@ type Stack struct {
 	interfaceAddrs map[int32][]inet.InterfaceAddr
 	routes         []inet.Route
 	supportsIPv6   bool
+	tcpRecovery    inet.TCPLossRecovery
 	tcpRecvBufSize inet.TCPBufferSize
 	tcpSendBufSize inet.TCPBufferSize
 	tcpSACKEnabled bool
@@ -310,6 +311,11 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 	return addrs
 }
 
+// AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
+func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	return syserror.EACCES
+}
+
 // SupportsIPv6 implements inet.Stack.SupportsIPv6.
 func (s *Stack) SupportsIPv6() bool {
 	return s.supportsIPv6
@@ -342,6 +348,16 @@ func (s *Stack) TCPSACKEnabled() (bool, error) {
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
 func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
+	return syserror.EACCES
+}
+
+// TCPRecovery implements inet.Stack.TCPRecovery.
+func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
+	return s.tcpRecovery, nil
+}
+
+// SetTCPRecovery implements inet.Stack.SetTCPRecovery.
+func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
 	return syserror.EACCES
 }
 

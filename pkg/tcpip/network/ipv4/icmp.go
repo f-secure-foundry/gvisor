@@ -15,7 +15,6 @@
 package ipv4
 
 import (
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -25,8 +24,12 @@ import (
 // the original packet that caused the ICMP one to be sent. This information is
 // used to find out which transport endpoint must be notified about the ICMP
 // packet.
-func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt tcpip.PacketBuffer) {
-	h := header.IPv4(pkt.Data.First())
+func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt *stack.PacketBuffer) {
+	h, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
+	if !ok {
+		return
+	}
+	hdr := header.IPv4(h)
 
 	// We don't use IsValid() here because ICMP only requires that the IP
 	// header plus 8 bytes of the transport header be included. So it's
@@ -35,12 +38,12 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt tcpip.
 	//
 	// Drop packet if it doesn't have the basic IPv4 header or if the
 	// original source address doesn't match the endpoint's address.
-	if len(h) < header.IPv4MinimumSize || h.SourceAddress() != e.id.LocalAddress {
+	if hdr.SourceAddress() != e.id.LocalAddress {
 		return
 	}
 
-	hlen := int(h.HeaderLength())
-	if pkt.Data.Size() < hlen || h.FragmentOffset() != 0 {
+	hlen := int(hdr.HeaderLength())
+	if pkt.Data.Size() < hlen || hdr.FragmentOffset() != 0 {
 		// We won't be able to handle this if it doesn't contain the
 		// full IPv4 header, or if it's a fragment not at offset 0
 		// (because it won't have the transport header).
@@ -49,15 +52,18 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt tcpip.
 
 	// Skip the ip header, then deliver control message.
 	pkt.Data.TrimFront(hlen)
-	p := h.TransportProtocol()
-	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, pkt)
+	p := hdr.TransportProtocol()
+	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, hdr.DestinationAddress(), ProtocolNumber, p, typ, extra, pkt)
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, pkt tcpip.PacketBuffer) {
+func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 	stats := r.Stats()
 	received := stats.ICMP.V4PacketsReceived
-	v := pkt.Data.First()
-	if len(v) < header.ICMPv4MinimumSize {
+	// TODO(gvisor.dev/issue/170): ICMP packets don't have their
+	// TransportHeader fields set. See icmp/protocol.go:protocol.Parse for a
+	// full explanation.
+	v, ok := pkt.Data.PullUp(header.ICMPv4MinimumSize)
+	if !ok {
 		received.Invalid.Increment()
 		return
 	}
@@ -85,10 +91,30 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt tcpip.PacketBuffer) {
 
 		// It's possible that a raw socket expects to receive this.
 		h.SetChecksum(wantChecksum)
-		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, tcpip.PacketBuffer{
+		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, &stack.PacketBuffer{
 			Data:          pkt.Data.Clone(nil),
 			NetworkHeader: append(buffer.View(nil), pkt.NetworkHeader...),
 		})
+
+		remoteLinkAddr := r.RemoteLinkAddress
+
+		// As per RFC 1122 section 3.2.1.3, when a host sends any datagram, the IP
+		// source address MUST be one of its own IP addresses (but not a broadcast
+		// or multicast address).
+		localAddr := r.LocalAddress
+		if r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) {
+			localAddr = ""
+		}
+
+		r, err := r.Stack().FindRoute(e.NICID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+		if err != nil {
+			// If we cannot find a route to the destination, silently drop the packet.
+			return
+		}
+		defer r.Release()
+
+		// Use the remote link address from the incoming packet.
+		r.ResolveWith(remoteLinkAddr)
 
 		vv := pkt.Data.Clone(nil)
 		vv.TrimFront(header.ICMPv4MinimumSize)
@@ -99,7 +125,11 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt tcpip.PacketBuffer) {
 		pkt.SetChecksum(0)
 		pkt.SetChecksum(^header.Checksum(pkt, header.ChecksumVV(vv, 0)))
 		sent := stats.ICMP.V4PacketsSent
-		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv4ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}, tcpip.PacketBuffer{
+		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+			Protocol: header.ICMPv4ProtocolNumber,
+			TTL:      r.DefaultTTL(),
+			TOS:      stack.DefaultTOS,
+		}, &stack.PacketBuffer{
 			Header:          hdr,
 			Data:            vv,
 			TransportHeader: buffer.View(pkt),
@@ -119,6 +149,9 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt tcpip.PacketBuffer) {
 
 		pkt.Data.TrimFront(header.ICMPv4MinimumSize)
 		switch h.Code() {
+		case header.ICMPv4HostUnreachable:
+			e.handleControl(stack.ControlNoRoute, 0, pkt)
+
 		case header.ICMPv4PortUnreachable:
 			e.handleControl(stack.ControlPortUnreachable, 0, pkt)
 

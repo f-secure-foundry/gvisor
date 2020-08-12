@@ -14,7 +14,7 @@
 
 package kernel
 
-import "sync"
+import "gvisor.dev/gvisor/pkg/sync"
 
 // TTY defines the relationship between a thread group and its controlling
 // terminal.
@@ -33,6 +33,8 @@ type TTY struct {
 // TTY returns the thread group's controlling terminal. If nil, there is no
 // controlling terminal.
 func (tg *ThreadGroup) TTY() *TTY {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
 	return tg.tty

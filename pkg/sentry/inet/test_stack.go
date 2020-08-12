@@ -25,6 +25,7 @@ type TestStack struct {
 	TCPRecvBufSize    TCPBufferSize
 	TCPSendBufSize    TCPBufferSize
 	TCPSACKFlag       bool
+	Recovery          TCPLossRecovery
 }
 
 // NewTestStack returns a TestStack with no network interfaces. The value of
@@ -45,6 +46,12 @@ func (s *TestStack) Interfaces() map[int32]Interface {
 // InterfaceAddrs implements Stack.InterfaceAddrs.
 func (s *TestStack) InterfaceAddrs() map[int32][]InterfaceAddr {
 	return s.InterfaceAddrsMap
+}
+
+// AddInterfaceAddr implements Stack.AddInterfaceAddr.
+func (s *TestStack) AddInterfaceAddr(idx int32, addr InterfaceAddr) error {
+	s.InterfaceAddrsMap[idx] = append(s.InterfaceAddrsMap[idx], addr)
+	return nil
 }
 
 // SupportsIPv6 implements Stack.SupportsIPv6.
@@ -82,6 +89,17 @@ func (s *TestStack) TCPSACKEnabled() (bool, error) {
 // SetTCPSACKEnabled implements Stack.SetTCPSACKEnabled.
 func (s *TestStack) SetTCPSACKEnabled(enabled bool) error {
 	s.TCPSACKFlag = enabled
+	return nil
+}
+
+// TCPRecovery implements Stack.TCPRecovery.
+func (s *TestStack) TCPRecovery() (TCPLossRecovery, error) {
+	return s.Recovery, nil
+}
+
+// SetTCPRecovery implements Stack.SetTCPRecovery.
+func (s *TestStack) SetTCPRecovery(recovery TCPLossRecovery) error {
+	s.Recovery = recovery
 	return nil
 }
 

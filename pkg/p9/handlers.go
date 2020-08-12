@@ -48,6 +48,8 @@ func ExtractErrno(err error) syscall.Errno {
 		return ExtractErrno(e.Err)
 	case *os.SyscallError:
 		return ExtractErrno(e.Err)
+	case *os.LinkError:
+		return ExtractErrno(e.Err)
 	}
 
 	// Default case.
@@ -910,6 +912,95 @@ func (t *Txattrcreate) handle(cs *connState) message {
 
 	// We don't support extended attributes.
 	return newErr(syscall.ENOSYS)
+}
+
+// handle implements handler.handle.
+func (t *Tgetxattr) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(syscall.EBADF)
+	}
+	defer ref.DecRef()
+
+	var val string
+	if err := ref.safelyRead(func() (err error) {
+		// Don't allow getxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		val, err = ref.file.GetXattr(t.Name, t.Size)
+		return err
+	}); err != nil {
+		return newErr(err)
+	}
+	return &Rgetxattr{Value: val}
+}
+
+// handle implements handler.handle.
+func (t *Tsetxattr) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(syscall.EBADF)
+	}
+	defer ref.DecRef()
+
+	if err := ref.safelyWrite(func() error {
+		// Don't allow setxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		return ref.file.SetXattr(t.Name, t.Value, t.Flags)
+	}); err != nil {
+		return newErr(err)
+	}
+	return &Rsetxattr{}
+}
+
+// handle implements handler.handle.
+func (t *Tlistxattr) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(syscall.EBADF)
+	}
+	defer ref.DecRef()
+
+	var xattrs map[string]struct{}
+	if err := ref.safelyRead(func() (err error) {
+		// Don't allow listxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		xattrs, err = ref.file.ListXattr(t.Size)
+		return err
+	}); err != nil {
+		return newErr(err)
+	}
+
+	xattrList := make([]string, 0, len(xattrs))
+	for x := range xattrs {
+		xattrList = append(xattrList, x)
+	}
+	return &Rlistxattr{Xattrs: xattrList}
+}
+
+// handle implements handler.handle.
+func (t *Tremovexattr) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(syscall.EBADF)
+	}
+	defer ref.DecRef()
+
+	if err := ref.safelyWrite(func() error {
+		// Don't allow removexattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		return ref.file.RemoveXattr(t.Name)
+	}); err != nil {
+		return newErr(err)
+	}
+	return &Rremovexattr{}
 }
 
 // handle implements handler.handle.

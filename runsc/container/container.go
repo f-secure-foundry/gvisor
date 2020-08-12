@@ -17,11 +17,11 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,8 +30,11 @@ import (
 
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/sighandling"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/sandbox"
@@ -273,7 +276,7 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 	}
 
 	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
-		return nil, fmt.Errorf("creating container root directory: %v", err)
+		return nil, fmt.Errorf("creating container root directory %q: %v", conf.RootDir, err)
 	}
 
 	c := &Container{
@@ -291,7 +294,7 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 	}
 	// The Cleanup object cleans up partially created containers when an error
 	// occurs. Any errors occurring during cleanup itself are ignored.
-	cu := specutils.MakeCleanup(func() { _ = c.Destroy() })
+	cu := cleanup.Make(func() { _ = c.Destroy() })
 	defer cu.Clean()
 
 	// Lock the container metadata file to prevent concurrent creations of
@@ -321,7 +324,7 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 			}
 		}
 		if err := runInCgroup(cg, func() error {
-			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir)
+			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir, args.Attached)
 			if err != nil {
 				return err
 			}
@@ -400,7 +403,7 @@ func (c *Container) Start(conf *boot.Config) error {
 	if err := c.Saver.lock(); err != nil {
 		return err
 	}
-	unlock := specutils.MakeCleanup(func() { c.Saver.unlock() })
+	unlock := cleanup.Make(func() { c.Saver.unlock() })
 	defer unlock.Clean()
 
 	if err := c.requireStatus("start", Created); err != nil {
@@ -420,11 +423,11 @@ func (c *Container) Start(conf *boot.Config) error {
 			return err
 		}
 	} else {
-		// Join cgroup to strt gofer process to ensure it's part of the cgroup from
+		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		if err := runInCgroup(c.Sandbox.Cgroup, func() error {
 			// Create the gofer process.
-			ioFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir)
+			ioFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir, false)
 			if err != nil {
 				return err
 			}
@@ -504,7 +507,7 @@ func Run(conf *boot.Config, args Args) (syscall.WaitStatus, error) {
 	}
 	// Clean up partially created container if an error occurs.
 	// Any errors returned by Destroy() itself are ignored.
-	cu := specutils.MakeCleanup(func() {
+	cu := cleanup.Make(func() {
 		c.Destroy()
 	})
 	defer cu.Clean()
@@ -620,21 +623,15 @@ func (c *Container) SignalProcess(sig syscall.Signal, pid int32) error {
 // forwarding signals.
 func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 	log.Debugf("Forwarding all signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh)
-	go func() {
-		for s := range sigCh {
-			log.Debugf("Forwarding signal %d to container %q PID %d fgProcess=%t", s, c.ID, pid, fgProcess)
-			if err := c.Sandbox.SignalProcess(c.ID, pid, s.(syscall.Signal), fgProcess); err != nil {
-				log.Warningf("error forwarding signal %d to container %q: %v", s, c.ID, err)
-			}
+	stop := sighandling.StartSignalForwarding(func(sig linux.Signal) {
+		log.Debugf("Forwarding signal %d to container %q PID %d fgProcess=%t", sig, c.ID, pid, fgProcess)
+		if err := c.Sandbox.SignalProcess(c.ID, pid, syscall.Signal(sig), fgProcess); err != nil {
+			log.Warningf("error forwarding signal %d to container %q: %v", sig, c.ID, err)
 		}
-		log.Debugf("Done forwarding signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
-	}()
-
+	})
 	return func() {
-		signal.Stop(sigCh)
-		close(sigCh)
+		log.Debugf("Done forwarding signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
+		stop()
 	}
 }
 
@@ -864,7 +861,7 @@ func (c *Container) waitForStopped() error {
 	return backoff.Retry(op, b)
 }
 
-func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]*os.File, *os.File, error) {
+func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bundleDir string, attached bool) ([]*os.File, *os.File, error) {
 	// Start with the general config flags.
 	args := conf.ToFlags()
 
@@ -957,6 +954,14 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bund
 	cmd := exec.Command(binPath, args...)
 	cmd.ExtraFiles = goferEnds
 	cmd.Args[0] = "runsc-gofer"
+
+	if attached {
+		// The gofer is attached to the lifetime of this process, so it
+		// should synchronously die when this process dies.
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Pdeathsig: syscall.SIGKILL,
+		}
+	}
 
 	// Enter new namespaces to isolate from the rest of the system. Don't unshare
 	// cgroup because gofer is added to a cgroup in the caller's namespace.
@@ -1066,27 +1071,19 @@ func runInCgroup(cg *cgroup.Cgroup, fn func() error) error {
 
 // adjustGoferOOMScoreAdj sets the oom_store_adj for the container's gofer.
 func (c *Container) adjustGoferOOMScoreAdj() error {
-	if c.GoferPid != 0 && c.Spec.Process.OOMScoreAdj != nil {
-		if err := setOOMScoreAdj(c.GoferPid, *c.Spec.Process.OOMScoreAdj); err != nil {
-			// Ignore NotExist error because it can be returned when the sandbox
-			// exited while OOM score was being adjusted.
-			if !os.IsNotExist(err) {
-				return fmt.Errorf("setting gofer oom_score_adj for container %q: %v", c.ID, err)
-			}
-			log.Warningf("Gofer process (%d) not found setting oom_score_adj", c.GoferPid)
-		}
+	if c.GoferPid == 0 || c.Spec.Process.OOMScoreAdj == nil {
+		return nil
 	}
-
-	return nil
+	return setOOMScoreAdj(c.GoferPid, *c.Spec.Process.OOMScoreAdj)
 }
 
 // adjustSandboxOOMScoreAdj sets the oom_score_adj for the sandbox.
 // oom_score_adj is set to the lowest oom_score_adj among the containers
 // running in the sandbox.
 //
-// TODO(gvisor.dev/issue/512): This call could race with other containers being
+// TODO(gvisor.dev/issue/238): This call could race with other containers being
 // created at the same time and end up setting the wrong oom_score_adj to the
-// sandbox.
+// sandbox. Use rpc client to synchronize.
 func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, rootDir string, destroy bool) error {
 	containers, err := loadSandbox(rootDir, s.ID)
 	if err != nil {
@@ -1154,29 +1151,29 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, rootDir string, destroy bool) 
 	}
 
 	// Set the lowest of all containers oom_score_adj to the sandbox.
-	if err := setOOMScoreAdj(s.Pid, lowScore); err != nil {
-		// Ignore NotExist error because it can be returned when the sandbox
-		// exited while OOM score was being adjusted.
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("setting oom_score_adj for sandbox %q: %v", s.ID, err)
-		}
-		log.Warningf("Sandbox process (%d) not found setting oom_score_adj", s.Pid)
-	}
-
-	return nil
+	return setOOMScoreAdj(s.Pid, lowScore)
 }
 
 // setOOMScoreAdj sets oom_score_adj to the given value for the given PID.
 // /proc must be available and mounted read-write. scoreAdj should be between
-// -1000 and 1000.
+// -1000 and 1000. It's a noop if the process has already exited.
 func setOOMScoreAdj(pid int, scoreAdj int) error {
 	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0644)
 	if err != nil {
+		// Ignore NotExist errors because it can race with process exit.
+		if os.IsNotExist(err) {
+			log.Warningf("Process (%d) not found setting oom_score_adj", pid)
+			return nil
+		}
 		return err
 	}
 	defer f.Close()
 	if _, err := f.WriteString(strconv.Itoa(scoreAdj)); err != nil {
-		return err
+		if errors.Is(err, syscall.ESRCH) {
+			log.Warningf("Process (%d) exited while setting oom_score_adj", pid)
+			return nil
+		}
+		return fmt.Errorf("setting oom_score_adj to %q: %v", scoreAdj, err)
 	}
 	return nil
 }

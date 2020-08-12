@@ -17,7 +17,6 @@ package boot
 import (
 	"fmt"
 	"os"
-	"sync"
 	"syscall"
 
 	"github.com/golang/protobuf/proto"
@@ -27,6 +26,7 @@ import (
 	ucspb "gvisor.dev/gvisor/pkg/sentry/kernel/uncaught_signal_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	spb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 func initCompatLogs(fd int) error {
@@ -65,7 +65,7 @@ func newCompatEmitter(logFD int) (*compatEmitter, error) {
 
 	if logFD > 0 {
 		f := os.NewFile(uintptr(logFD), "user log file")
-		target := log.MultiEmitter{c.sink, log.K8sJSONEmitter{log.Writer{Next: f}}}
+		target := &log.MultiEmitter{c.sink, log.K8sJSONEmitter{&log.Writer{Next: f}}}
 		c.sink = &log.BasicLogger{Level: log.Info, Emitter: target}
 	}
 	return c, nil
@@ -119,7 +119,13 @@ func (c *compatEmitter) emitUnimplementedSyscall(us *spb.UnimplementedSyscall) {
 	}
 
 	if tr.shouldReport(regs) {
-		c.sink.Infof("Unsupported syscall: %s, regs: %+v", c.nameMap.Name(uintptr(sysnr)), regs)
+		name := c.nameMap.Name(uintptr(sysnr))
+		c.sink.Infof("Unsupported syscall %s(%#x,%#x,%#x,%#x,%#x,%#x). It is "+
+			"likely that you can safely ignore this message and that this is not "+
+			"the cause of any error. Please, refer to %s/%s for more information.",
+			name, argVal(0, regs), argVal(1, regs), argVal(2, regs), argVal(3, regs),
+			argVal(4, regs), argVal(5, regs), syscallLink, name)
+
 		tr.onReported(regs)
 	}
 }

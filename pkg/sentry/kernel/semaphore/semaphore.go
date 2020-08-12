@@ -17,14 +17,14 @@ package semaphore
 
 import (
 	"fmt"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
@@ -554,6 +554,7 @@ func (s *sem) wakeWaiters() {
 	for w := s.waiters.Front(); w != nil; {
 		if s.value < w.value {
 			// Still blocked, skip it.
+			w = w.Next()
 			continue
 		}
 		w.ch <- struct{}{}

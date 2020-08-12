@@ -18,12 +18,14 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -40,16 +42,47 @@ type FileDescription struct {
 	// operations.
 	refs int64
 
+	// flagsMu protects statusFlags and asyncHandler below.
+	flagsMu sync.Mutex
+
 	// statusFlags contains status flags, "initialized by open(2) and possibly
-	// modified by fcntl()" - fcntl(2). statusFlags is accessed using atomic
-	// memory operations.
+	// modified by fcntl()" - fcntl(2). statusFlags can be read using atomic
+	// memory operations when it does not need to be synchronized with an
+	// access to asyncHandler.
 	statusFlags uint32
+
+	// asyncHandler handles O_ASYNC signal generation. It is set with the
+	// F_SETOWN or F_SETOWN_EX fcntls. For asyncHandler to be used, O_ASYNC must
+	// also be set by fcntl(2).
+	asyncHandler FileAsync
+
+	// epolls is the set of epollInterests registered for this FileDescription.
+	// epolls is protected by epollMu.
+	epollMu sync.Mutex
+	epolls  map[*epollInterest]struct{}
 
 	// vd is the filesystem location at which this FileDescription was opened.
 	// A reference is held on vd. vd is immutable.
 	vd VirtualDentry
 
+	// opts contains options passed to FileDescription.Init(). opts is
+	// immutable.
 	opts FileDescriptionOptions
+
+	// readable is MayReadFileWithOpenFlags(statusFlags). readable is
+	// immutable.
+	//
+	// readable is analogous to Linux's FMODE_READ.
+	readable bool
+
+	// writable is MayWriteFileWithOpenFlags(statusFlags). If writable is true,
+	// the FileDescription holds a write count on vd.mount. writable is
+	// immutable.
+	//
+	// writable is analogous to Linux's FMODE_WRITE.
+	writable bool
+
+	usedLockBSD uint32
 
 	// impl is the FileDescriptionImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in FileDescription.
@@ -58,23 +91,62 @@ type FileDescription struct {
 
 // FileDescriptionOptions contains options to FileDescription.Init().
 type FileDescriptionOptions struct {
-	// If AllowDirectIO is true, allow O_DIRECT to be set on the file. This is
-	// usually only the case if O_DIRECT would actually have an effect.
+	// If AllowDirectIO is true, allow O_DIRECT to be set on the file.
 	AllowDirectIO bool
+
+	// If DenyPRead is true, calls to FileDescription.PRead() return ESPIPE.
+	DenyPRead bool
+
+	// If DenyPWrite is true, calls to FileDescription.PWrite() return
+	// ESPIPE.
+	DenyPWrite bool
+
+	// If UseDentryMetadata is true, calls to FileDescription methods that
+	// interact with file and filesystem metadata (Stat, SetStat, StatFS,
+	// Listxattr, Getxattr, Setxattr, Removexattr) are implemented by calling
+	// the corresponding FilesystemImpl methods instead of the corresponding
+	// FileDescriptionImpl methods.
+	//
+	// UseDentryMetadata is intended for file descriptions that are implemented
+	// outside of individual filesystems, such as pipes, sockets, and device
+	// special files. FileDescriptions for which UseDentryMetadata is true may
+	// embed DentryMetadataFileDescriptionImpl to obtain appropriate
+	// implementations of FileDescriptionImpl methods that should not be
+	// called.
+	UseDentryMetadata bool
 }
 
-// Init must be called before first use of fd. It takes ownership of references
-// on mnt and d held by the caller. statusFlags is the initial file description
-// status flags, which is usually the full set of flags passed to open(2).
-func (fd *FileDescription) Init(impl FileDescriptionImpl, statusFlags uint32, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) {
+// FileCreationFlags are the set of flags passed to FileDescription.Init() but
+// omitted from FileDescription.StatusFlags().
+const FileCreationFlags = linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC
+
+// Init must be called before first use of fd. If it succeeds, it takes
+// references on mnt and d. flags is the initial file description flags, which
+// is usually the full set of flags passed to open(2).
+func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) error {
+	writable := MayWriteFileWithOpenFlags(flags)
+	if writable {
+		if err := mnt.CheckBeginWrite(); err != nil {
+			return err
+		}
+	}
+
 	fd.refs = 1
-	fd.statusFlags = statusFlags | linux.O_LARGEFILE
+
+	// Remove "file creation flags" to mirror the behavior from file.f_flags in
+	// fs/open.c:do_dentry_open.
+	fd.statusFlags = flags &^ FileCreationFlags
 	fd.vd = VirtualDentry{
 		mount:  mnt,
 		dentry: d,
 	}
+	mnt.IncRef()
+	d.IncRef()
 	fd.opts = *opts
+	fd.readable = MayReadFileWithOpenFlags(flags)
+	fd.writable = writable
 	fd.impl = impl
+	return nil
 }
 
 // IncRef increments fd's reference count.
@@ -99,13 +171,52 @@ func (fd *FileDescription) TryIncRef() bool {
 }
 
 // DecRef decrements fd's reference count.
-func (fd *FileDescription) DecRef() {
+func (fd *FileDescription) DecRef(ctx context.Context) {
 	if refs := atomic.AddInt64(&fd.refs, -1); refs == 0 {
-		fd.impl.Release()
-		fd.vd.DecRef()
+		// Unregister fd from all epoll instances.
+		fd.epollMu.Lock()
+		epolls := fd.epolls
+		fd.epolls = nil
+		fd.epollMu.Unlock()
+		for epi := range epolls {
+			ep := epi.epoll
+			ep.interestMu.Lock()
+			// Check that epi has not been concurrently unregistered by
+			// EpollInstance.DeleteInterest() or EpollInstance.Release().
+			if _, ok := ep.interest[epi.key]; ok {
+				fd.EventUnregister(&epi.waiter)
+				ep.removeLocked(epi)
+			}
+			ep.interestMu.Unlock()
+		}
+
+		// If BSD locks were used, release any lock that it may have acquired.
+		if atomic.LoadUint32(&fd.usedLockBSD) != 0 {
+			fd.impl.UnlockBSD(context.Background(), fd)
+		}
+
+		// Release implementation resources.
+		fd.impl.Release(ctx)
+		if fd.writable {
+			fd.vd.mount.EndWrite()
+		}
+		fd.vd.DecRef(ctx)
+		fd.flagsMu.Lock()
+		// TODO(gvisor.dev/issue/1663): We may need to unregister during save, as we do in VFS1.
+		if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
+			fd.asyncHandler.Unregister(fd)
+		}
+		fd.asyncHandler = nil
+		fd.flagsMu.Unlock()
 	} else if refs < 0 {
 		panic("FileDescription.DecRef() called without holding a reference")
 	}
+}
+
+// Refs returns the current number of references. The returned count
+// is inherently racy and is unsafe to use without external synchronization.
+func (fd *FileDescription) Refs() int64 {
+	return atomic.LoadInt64(&fd.refs)
 }
 
 // Mount returns the mount on which fd was opened. It does not take a reference
@@ -126,6 +237,11 @@ func (fd *FileDescription) VirtualDentry() VirtualDentry {
 	return fd.vd
 }
 
+// Options returns the options passed to fd.Init().
+func (fd *FileDescription) Options() FileDescriptionOptions {
+	return fd.opts
+}
+
 // StatusFlags returns file description status flags, as for fcntl(F_GETFL).
 func (fd *FileDescription) StatusFlags() uint32 {
 	return atomic.LoadUint32(&fd.statusFlags)
@@ -140,7 +256,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	// sense. However, the check as actually implemented seems to be "O_APPEND
 	// cannot be changed if the file is marked as append-only".
 	if (flags^oldFlags)&linux.O_APPEND != 0 {
-		stat, err := fd.impl.Stat(ctx, StatOptions{
+		stat, err := fd.Stat(ctx, StatOptions{
 			// There is no mask bit for stx_attributes.
 			Mask: 0,
 			// Linux just reads inode::i_flags directly.
@@ -154,7 +270,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 		}
 	}
 	if (flags&linux.O_NOATIME != 0) && (oldFlags&linux.O_NOATIME == 0) {
-		stat, err := fd.impl.Stat(ctx, StatOptions{
+		stat, err := fd.Stat(ctx, StatOptions{
 			Mask: linux.STATX_UID,
 			// Linux's inode_owner_or_capable() just reads inode::i_uid
 			// directly.
@@ -173,10 +289,31 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	if flags&linux.O_DIRECT != 0 && !fd.opts.AllowDirectIO {
 		return syserror.EINVAL
 	}
-	// TODO(jamieliu): FileDescriptionImpl.SetOAsync()?
+	// TODO(gvisor.dev/issue/1035): FileDescriptionImpl.SetOAsync()?
 	const settableFlags = linux.O_APPEND | linux.O_ASYNC | linux.O_DIRECT | linux.O_NOATIME | linux.O_NONBLOCK
+	fd.flagsMu.Lock()
+	if fd.asyncHandler != nil {
+		// Use fd.statusFlags instead of oldFlags, which may have become outdated,
+		// to avoid double registering/unregistering.
+		if fd.statusFlags&linux.O_ASYNC == 0 && flags&linux.O_ASYNC != 0 {
+			fd.asyncHandler.Register(fd)
+		} else if fd.statusFlags&linux.O_ASYNC != 0 && flags&linux.O_ASYNC == 0 {
+			fd.asyncHandler.Unregister(fd)
+		}
+	}
 	atomic.StoreUint32(&fd.statusFlags, (oldFlags&^settableFlags)|(flags&settableFlags))
+	fd.flagsMu.Unlock()
 	return nil
+}
+
+// IsReadable returns true if fd was opened for reading.
+func (fd *FileDescription) IsReadable() bool {
+	return fd.readable
+}
+
+// IsWritable returns true if fd was opened for writing.
+func (fd *FileDescription) IsWritable() bool {
+	return fd.writable
 }
 
 // Impl returns the FileDescriptionImpl associated with fd.
@@ -192,11 +329,13 @@ func (fd *FileDescription) Impl() FileDescriptionImpl {
 // be interpreted as IDs in the root UserNamespace (i.e. as auth.KUID and
 // auth.KGID respectively).
 //
+// All methods may return errors not specified.
+//
 // FileDescriptionImpl is analogous to Linux's struct file_operations.
 type FileDescriptionImpl interface {
 	// Release is called when the associated FileDescription reaches zero
 	// references.
-	Release()
+	Release(ctx context.Context)
 
 	// OnClose is called when a file descriptor representing the
 	// FileDescription is closed. Note that returning a non-nil error does not
@@ -207,12 +346,19 @@ type FileDescriptionImpl interface {
 	Stat(ctx context.Context, opts StatOptions) (linux.Statx, error)
 
 	// SetStat updates metadata for the file represented by the
-	// FileDescription.
+	// FileDescription. Implementations are responsible for checking if the
+	// operation can be performed (see vfs.CheckSetStat() for common checks).
 	SetStat(ctx context.Context, opts SetStatOptions) error
 
 	// StatFS returns metadata for the filesystem containing the file
 	// represented by the FileDescription.
 	StatFS(ctx context.Context) (linux.Statfs, error)
+
+	// Allocate grows the file to offset + length bytes.
+	// Only mode == 0 is supported currently.
+	//
+	// Preconditions: The FileDescription was opened for writing.
+	Allocate(ctx context.Context, mode, offset, length uint64) error
 
 	// waiter.Waitable methods may be used to poll for I/O events.
 	waiter.Waitable
@@ -220,6 +366,13 @@ type FileDescriptionImpl interface {
 	// PRead reads from the file into dst, starting at the given offset, and
 	// returns the number of bytes read. PRead is permitted to return partial
 	// reads with a nil error.
+	//
+	// Errors:
+	//
+	// - If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for reading.
+	// FileDescriptionOptions.DenyPRead == false.
 	PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error)
 
 	// Read is similar to PRead, but does not specify an offset.
@@ -229,6 +382,12 @@ type FileDescriptionImpl interface {
 	// the number of bytes read; note that POSIX 2.9.7 "Thread Interactions
 	// with Regular File Operations" requires that all operations that may
 	// mutate the FileDescription offset are serialized.
+	//
+	// Errors:
+	//
+	// - If opts.Flags specifies unsupported options, Read returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for reading.
 	Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error)
 
 	// PWrite writes src to the file, starting at the given offset, and returns
@@ -238,6 +397,14 @@ type FileDescriptionImpl interface {
 	// As in Linux (but not POSIX), if O_APPEND is in effect for the
 	// FileDescription, PWrite should ignore the offset and append data to the
 	// end of the file.
+	//
+	// Errors:
+	//
+	// - If opts.Flags specifies unsupported options, PWrite returns
+	// EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for writing.
+	// FileDescriptionOptions.DenyPWrite == false.
 	PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error)
 
 	// Write is similar to PWrite, but does not specify an offset, which is
@@ -247,6 +414,12 @@ type FileDescriptionImpl interface {
 	// PWrite that uses a FileDescription offset, to make it possible for
 	// remote filesystems to implement O_APPEND correctly (i.e. atomically with
 	// respect to writers outside the scope of VFS).
+	//
+	// Errors:
+	//
+	// - If opts.Flags specifies unsupported options, Write returns EOPNOTSUPP.
+	//
+	// Preconditions: The FileDescription was opened for writing.
 	Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error)
 
 	// IterDirents invokes cb on each entry in the directory represented by the
@@ -277,11 +450,11 @@ type FileDescriptionImpl interface {
 	Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error)
 
 	// Listxattr returns all extended attribute names for the file.
-	Listxattr(ctx context.Context) ([]string, error)
+	Listxattr(ctx context.Context, size uint64) ([]string, error)
 
 	// Getxattr returns the value associated with the given extended attribute
 	// for the file.
-	Getxattr(ctx context.Context, name string) (string, error)
+	Getxattr(ctx context.Context, opts GetxattrOptions) (string, error)
 
 	// Setxattr changes the value associated with the given extended attribute
 	// for the file.
@@ -290,7 +463,17 @@ type FileDescriptionImpl interface {
 	// Removexattr removes the given extended attribute from the file.
 	Removexattr(ctx context.Context, name string) error
 
-	// TODO: file locking
+	// LockBSD tries to acquire a BSD-style advisory file lock.
+	LockBSD(ctx context.Context, uid lock.UniqueID, t lock.LockType, block lock.Blocker) error
+
+	// UnlockBSD releases a BSD-style advisory file lock.
+	UnlockBSD(ctx context.Context, uid lock.UniqueID) error
+
+	// LockPOSIX tries to acquire a POSIX-style advisory file lock.
+	LockPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, start, length uint64, whence int16, block lock.Blocker) error
+
+	// UnlockPOSIX releases a POSIX-style advisory file lock.
+	UnlockPOSIX(ctx context.Context, uid lock.UniqueID, start, length uint64, whence int16) error
 }
 
 // Dirent holds the information contained in struct linux_dirent64.
@@ -313,11 +496,20 @@ type Dirent struct {
 
 // IterDirentsCallback receives Dirents from FileDescriptionImpl.IterDirents.
 type IterDirentsCallback interface {
-	// Handle handles the given iterated Dirent. It returns true if iteration
-	// should continue, and false if FileDescriptionImpl.IterDirents should
-	// terminate now and restart with the same Dirent the next time it is
-	// called.
-	Handle(dirent Dirent) bool
+	// Handle handles the given iterated Dirent. If Handle returns a non-nil
+	// error, FileDescriptionImpl.IterDirents must stop iteration and return
+	// the error; the next call to FileDescriptionImpl.IterDirents should
+	// restart with the same Dirent.
+	Handle(dirent Dirent) error
+}
+
+// IterDirentsCallbackFunc implements IterDirentsCallback for a function with
+// the semantics of IterDirentsCallback.Handle.
+type IterDirentsCallbackFunc func(dirent Dirent) error
+
+// Handle implements IterDirentsCallback.Handle.
+func (f IterDirentsCallbackFunc) Handle(dirent Dirent) error {
+	return f(dirent)
 }
 
 // OnClose is called when a file descriptor representing the FileDescription is
@@ -329,29 +521,97 @@ func (fd *FileDescription) OnClose(ctx context.Context) error {
 
 // Stat returns metadata for the file represented by fd.
 func (fd *FileDescription) Stat(ctx context.Context, opts StatOptions) (linux.Statx, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		stat, err := fd.vd.mount.fs.impl.StatAt(ctx, rp, opts)
+		vfsObj.putResolvingPath(ctx, rp)
+		return stat, err
+	}
 	return fd.impl.Stat(ctx, opts)
 }
 
 // SetStat updates metadata for the file represented by fd.
 func (fd *FileDescription) SetStat(ctx context.Context, opts SetStatOptions) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.SetStatAt(ctx, rp, opts)
+		vfsObj.putResolvingPath(ctx, rp)
+		return err
+	}
 	return fd.impl.SetStat(ctx, opts)
 }
 
 // StatFS returns metadata for the filesystem containing the file represented
 // by fd.
 func (fd *FileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		statfs, err := fd.vd.mount.fs.impl.StatFSAt(ctx, rp)
+		vfsObj.putResolvingPath(ctx, rp)
+		return statfs, err
+	}
 	return fd.impl.StatFS(ctx)
+}
+
+// Allocate grows file represented by FileDescription to offset + length bytes.
+func (fd *FileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if !fd.IsWritable() {
+		return syserror.EBADF
+	}
+	return fd.impl.Allocate(ctx, mode, offset, length)
+}
+
+// Readiness implements waiter.Waitable.Readiness.
+//
+// It returns fd's I/O readiness.
+func (fd *FileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return fd.impl.Readiness(mask)
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+//
+// It registers e for I/O readiness events in mask.
+func (fd *FileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+	fd.impl.EventRegister(e, mask)
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+//
+// It unregisters e for I/O readiness events.
+func (fd *FileDescription) EventUnregister(e *waiter.Entry) {
+	fd.impl.EventUnregister(e)
 }
 
 // PRead reads from the file represented by fd into dst, starting at the given
 // offset, and returns the number of bytes read. PRead is permitted to return
 // partial reads with a nil error.
 func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error) {
+	if fd.opts.DenyPRead {
+		return 0, syserror.ESPIPE
+	}
+	if !fd.readable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.PRead(ctx, dst, offset, opts)
 }
 
 // Read is similar to PRead, but does not specify an offset.
 func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
+	if !fd.readable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.Read(ctx, dst, opts)
 }
 
@@ -359,11 +619,20 @@ func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opt
 // offset, and returns the number of bytes written. PWrite is permitted to
 // return partial writes with a nil error.
 func (fd *FileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error) {
+	if fd.opts.DenyPWrite {
+		return 0, syserror.ESPIPE
+	}
+	if !fd.writable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.PWrite(ctx, src, offset, opts)
 }
 
 // Write is similar to PWrite, but does not specify an offset.
 func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error) {
+	if !fd.writable {
+		return 0, syserror.EBADF
+	}
 	return fd.impl.Write(ctx, src, opts)
 }
 
@@ -397,8 +666,23 @@ func (fd *FileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 
 // Listxattr returns all extended attribute names for the file represented by
 // fd.
-func (fd *FileDescription) Listxattr(ctx context.Context) ([]string, error) {
-	names, err := fd.impl.Listxattr(ctx)
+//
+// If the size of the list (including a NUL terminating byte after every entry)
+// would exceed size, ERANGE may be returned. Note that implementations
+// are free to ignore size entirely and return without error). In all cases,
+// if size is 0, the list should be returned without error, regardless of size.
+func (fd *FileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		names, err := fd.vd.mount.fs.impl.ListxattrAt(ctx, rp, size)
+		vfsObj.putResolvingPath(ctx, rp)
+		return names, err
+	}
+	names, err := fd.impl.Listxattr(ctx, size)
 	if err == syserror.ENOTSUP {
 		// Linux doesn't actually return ENOTSUP in this case; instead,
 		// fs/xattr.c:vfs_listxattr() falls back to allowing the security
@@ -411,19 +695,54 @@ func (fd *FileDescription) Listxattr(ctx context.Context) ([]string, error) {
 
 // Getxattr returns the value associated with the given extended attribute for
 // the file represented by fd.
-func (fd *FileDescription) Getxattr(ctx context.Context, name string) (string, error) {
-	return fd.impl.Getxattr(ctx, name)
+//
+// If the size of the return value exceeds opts.Size, ERANGE may be returned
+// (note that implementations are free to ignore opts.Size entirely and return
+// without error). In all cases, if opts.Size is 0, the value should be
+// returned without error, regardless of size.
+func (fd *FileDescription) Getxattr(ctx context.Context, opts *GetxattrOptions) (string, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		val, err := fd.vd.mount.fs.impl.GetxattrAt(ctx, rp, *opts)
+		vfsObj.putResolvingPath(ctx, rp)
+		return val, err
+	}
+	return fd.impl.Getxattr(ctx, *opts)
 }
 
 // Setxattr changes the value associated with the given extended attribute for
 // the file represented by fd.
-func (fd *FileDescription) Setxattr(ctx context.Context, opts SetxattrOptions) error {
-	return fd.impl.Setxattr(ctx, opts)
+func (fd *FileDescription) Setxattr(ctx context.Context, opts *SetxattrOptions) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.SetxattrAt(ctx, rp, *opts)
+		vfsObj.putResolvingPath(ctx, rp)
+		return err
+	}
+	return fd.impl.Setxattr(ctx, *opts)
 }
 
 // Removexattr removes the given extended attribute from the file represented
 // by fd.
 func (fd *FileDescription) Removexattr(ctx context.Context, name string) error {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		err := fd.vd.mount.fs.impl.RemovexattrAt(ctx, rp, name)
+		vfsObj.putResolvingPath(ctx, rp)
+		return err
+	}
 	return fd.impl.Removexattr(ctx, name)
 }
 
@@ -438,14 +757,14 @@ func (fd *FileDescription) MappedName(ctx context.Context) string {
 	vfsroot := RootFromContext(ctx)
 	s, _ := fd.vd.mount.vfs.PathnameWithDeleted(ctx, vfsroot, fd.vd)
 	if vfsroot.Ok() {
-		vfsroot.DecRef()
+		vfsroot.DecRef(ctx)
 	}
 	return s
 }
 
 // DeviceID implements memmap.MappingIdentity.DeviceID.
 func (fd *FileDescription) DeviceID() uint64 {
-	stat, err := fd.impl.Stat(context.Background(), StatOptions{
+	stat, err := fd.Stat(context.Background(), StatOptions{
 		// There is no STATX_DEV; we assume that Stat will return it if it's
 		// available regardless of mask.
 		Mask: 0,
@@ -461,7 +780,7 @@ func (fd *FileDescription) DeviceID() uint64 {
 
 // InodeID implements memmap.MappingIdentity.InodeID.
 func (fd *FileDescription) InodeID() uint64 {
-	stat, err := fd.impl.Stat(context.Background(), StatOptions{
+	stat, err := fd.Stat(context.Background(), StatOptions{
 		Mask: linux.STATX_INO,
 		// fs/proc/task_mmu.c:show_map_vma() just reads inode::i_ino directly.
 		Sync: linux.AT_STATX_DONT_SYNC,
@@ -474,5 +793,55 @@ func (fd *FileDescription) InodeID() uint64 {
 
 // Msync implements memmap.MappingIdentity.Msync.
 func (fd *FileDescription) Msync(ctx context.Context, mr memmap.MappableRange) error {
-	return fd.impl.Sync(ctx)
+	return fd.Sync(ctx)
+}
+
+// LockBSD tries to acquire a BSD-style advisory file lock.
+func (fd *FileDescription) LockBSD(ctx context.Context, lockType lock.LockType, blocker lock.Blocker) error {
+	atomic.StoreUint32(&fd.usedLockBSD, 1)
+	return fd.impl.LockBSD(ctx, fd, lockType, blocker)
+}
+
+// UnlockBSD releases a BSD-style advisory file lock.
+func (fd *FileDescription) UnlockBSD(ctx context.Context) error {
+	return fd.impl.UnlockBSD(ctx, fd)
+}
+
+// LockPOSIX locks a POSIX-style file range lock.
+func (fd *FileDescription) LockPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, start, end uint64, whence int16, block lock.Blocker) error {
+	return fd.impl.LockPOSIX(ctx, uid, t, start, end, whence, block)
+}
+
+// UnlockPOSIX unlocks a POSIX-style file range lock.
+func (fd *FileDescription) UnlockPOSIX(ctx context.Context, uid lock.UniqueID, start, end uint64, whence int16) error {
+	return fd.impl.UnlockPOSIX(ctx, uid, start, end, whence)
+}
+
+// A FileAsync sends signals to its owner when w is ready for IO. This is only
+// implemented by pkg/sentry/fasync:FileAsync, but we unfortunately need this
+// interface to avoid circular dependencies.
+type FileAsync interface {
+	Register(w waiter.Waitable)
+	Unregister(w waiter.Waitable)
+}
+
+// AsyncHandler returns the FileAsync for fd.
+func (fd *FileDescription) AsyncHandler() FileAsync {
+	fd.flagsMu.Lock()
+	defer fd.flagsMu.Unlock()
+	return fd.asyncHandler
+}
+
+// SetAsyncHandler sets fd.asyncHandler if it has not been set before and
+// returns it.
+func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsync {
+	fd.flagsMu.Lock()
+	defer fd.flagsMu.Unlock()
+	if fd.asyncHandler == nil {
+		fd.asyncHandler = newHandler()
+		if fd.statusFlags&linux.O_ASYNC != 0 {
+			fd.asyncHandler.Register(fd)
+		}
+	}
+	return fd.asyncHandler
 }

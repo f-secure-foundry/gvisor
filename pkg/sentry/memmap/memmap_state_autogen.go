@@ -6,88 +6,89 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *MappableRange) beforeSave() {}
-func (x *MappableRange) save(m state.Map) {
+func (x *FileRange) StateTypeName() string {
+	return "pkg/sentry/memmap.FileRange"
+}
+
+func (x *FileRange) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+	}
+}
+
+func (x *FileRange) beforeSave() {}
+
+func (x *FileRange) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
+	m.Save(0, &x.Start)
+	m.Save(1, &x.End)
+}
+
+func (x *FileRange) afterLoad() {}
+
+func (x *FileRange) StateLoad(m state.Source) {
+	m.Load(0, &x.Start)
+	m.Load(1, &x.End)
+}
+
+func (x *MappableRange) StateTypeName() string {
+	return "pkg/sentry/memmap.MappableRange"
+}
+
+func (x *MappableRange) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+	}
+}
+
+func (x *MappableRange) beforeSave() {}
+
+func (x *MappableRange) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.Start)
+	m.Save(1, &x.End)
 }
 
 func (x *MappableRange) afterLoad() {}
-func (x *MappableRange) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
+
+func (x *MappableRange) StateLoad(m state.Source) {
+	m.Load(0, &x.Start)
+	m.Load(1, &x.End)
+}
+
+func (x *MappingOfRange) StateTypeName() string {
+	return "pkg/sentry/memmap.MappingOfRange"
+}
+
+func (x *MappingOfRange) StateFields() []string {
+	return []string{
+		"MappingSpace",
+		"AddrRange",
+		"Writable",
+	}
 }
 
 func (x *MappingOfRange) beforeSave() {}
-func (x *MappingOfRange) save(m state.Map) {
+
+func (x *MappingOfRange) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save("MappingSpace", &x.MappingSpace)
-	m.Save("AddrRange", &x.AddrRange)
-	m.Save("Writable", &x.Writable)
+	m.Save(0, &x.MappingSpace)
+	m.Save(1, &x.AddrRange)
+	m.Save(2, &x.Writable)
 }
 
 func (x *MappingOfRange) afterLoad() {}
-func (x *MappingOfRange) load(m state.Map) {
-	m.Load("MappingSpace", &x.MappingSpace)
-	m.Load("AddrRange", &x.AddrRange)
-	m.Load("Writable", &x.Writable)
-}
 
-func (x *MappingSet) beforeSave() {}
-func (x *MappingSet) save(m state.Map) {
-	x.beforeSave()
-	var root *MappingSegmentDataSlices = x.saveRoot()
-	m.SaveValue("root", root)
-}
-
-func (x *MappingSet) afterLoad() {}
-func (x *MappingSet) load(m state.Map) {
-	m.LoadValue("root", new(*MappingSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*MappingSegmentDataSlices)) })
-}
-
-func (x *Mappingnode) beforeSave() {}
-func (x *Mappingnode) save(m state.Map) {
-	x.beforeSave()
-	m.Save("nrSegments", &x.nrSegments)
-	m.Save("parent", &x.parent)
-	m.Save("parentIndex", &x.parentIndex)
-	m.Save("hasChildren", &x.hasChildren)
-	m.Save("keys", &x.keys)
-	m.Save("values", &x.values)
-	m.Save("children", &x.children)
-}
-
-func (x *Mappingnode) afterLoad() {}
-func (x *Mappingnode) load(m state.Map) {
-	m.Load("nrSegments", &x.nrSegments)
-	m.Load("parent", &x.parent)
-	m.Load("parentIndex", &x.parentIndex)
-	m.Load("hasChildren", &x.hasChildren)
-	m.Load("keys", &x.keys)
-	m.Load("values", &x.values)
-	m.Load("children", &x.children)
-}
-
-func (x *MappingSegmentDataSlices) beforeSave() {}
-func (x *MappingSegmentDataSlices) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
-	m.Save("Values", &x.Values)
-}
-
-func (x *MappingSegmentDataSlices) afterLoad() {}
-func (x *MappingSegmentDataSlices) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
-	m.Load("Values", &x.Values)
+func (x *MappingOfRange) StateLoad(m state.Source) {
+	m.Load(0, &x.MappingSpace)
+	m.Load(1, &x.AddrRange)
+	m.Load(2, &x.Writable)
 }
 
 func init() {
-	state.Register("memmap.MappableRange", (*MappableRange)(nil), state.Fns{Save: (*MappableRange).save, Load: (*MappableRange).load})
-	state.Register("memmap.MappingOfRange", (*MappingOfRange)(nil), state.Fns{Save: (*MappingOfRange).save, Load: (*MappingOfRange).load})
-	state.Register("memmap.MappingSet", (*MappingSet)(nil), state.Fns{Save: (*MappingSet).save, Load: (*MappingSet).load})
-	state.Register("memmap.Mappingnode", (*Mappingnode)(nil), state.Fns{Save: (*Mappingnode).save, Load: (*Mappingnode).load})
-	state.Register("memmap.MappingSegmentDataSlices", (*MappingSegmentDataSlices)(nil), state.Fns{Save: (*MappingSegmentDataSlices).save, Load: (*MappingSegmentDataSlices).load})
+	state.Register((*FileRange)(nil))
+	state.Register((*MappableRange)(nil))
+	state.Register((*MappingOfRange)(nil))
 }

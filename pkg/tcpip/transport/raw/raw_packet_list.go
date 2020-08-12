@@ -52,11 +52,21 @@ func (l *rawPacketList) Back() *rawPacket {
 	return l.tail
 }
 
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+func (l *rawPacketList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (rawPacketElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
+
 // PushFront inserts the element e at the front of list l.
 func (l *rawPacketList) PushFront(e *rawPacket) {
-	rawPacketElementMapper{}.linkerFor(e).SetNext(l.head)
-	rawPacketElementMapper{}.linkerFor(e).SetPrev(nil)
-
+	linker := rawPacketElementMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
 		rawPacketElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -68,9 +78,9 @@ func (l *rawPacketList) PushFront(e *rawPacket) {
 
 // PushBack inserts the element e at the back of list l.
 func (l *rawPacketList) PushBack(e *rawPacket) {
-	rawPacketElementMapper{}.linkerFor(e).SetNext(nil)
-	rawPacketElementMapper{}.linkerFor(e).SetPrev(l.tail)
-
+	linker := rawPacketElementMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
 		rawPacketElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -91,17 +101,20 @@ func (l *rawPacketList) PushBackList(m *rawPacketList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
 func (l *rawPacketList) InsertAfter(b, e *rawPacket) {
-	a := rawPacketElementMapper{}.linkerFor(b).Next()
-	rawPacketElementMapper{}.linkerFor(e).SetNext(a)
-	rawPacketElementMapper{}.linkerFor(e).SetPrev(b)
-	rawPacketElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := rawPacketElementMapper{}.linkerFor(b)
+	eLinker := rawPacketElementMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
 		rawPacketElementMapper{}.linkerFor(a).SetPrev(e)
@@ -112,10 +125,13 @@ func (l *rawPacketList) InsertAfter(b, e *rawPacket) {
 
 // InsertBefore inserts e before a.
 func (l *rawPacketList) InsertBefore(a, e *rawPacket) {
-	b := rawPacketElementMapper{}.linkerFor(a).Prev()
-	rawPacketElementMapper{}.linkerFor(e).SetNext(a)
-	rawPacketElementMapper{}.linkerFor(e).SetPrev(b)
-	rawPacketElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := rawPacketElementMapper{}.linkerFor(a)
+	eLinker := rawPacketElementMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
 		rawPacketElementMapper{}.linkerFor(b).SetNext(e)
@@ -126,20 +142,24 @@ func (l *rawPacketList) InsertBefore(a, e *rawPacket) {
 
 // Remove removes e from l.
 func (l *rawPacketList) Remove(e *rawPacket) {
-	prev := rawPacketElementMapper{}.linkerFor(e).Prev()
-	next := rawPacketElementMapper{}.linkerFor(e).Next()
+	linker := rawPacketElementMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
 		rawPacketElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		rawPacketElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields

@@ -32,7 +32,6 @@ package watchdog
 import (
 	"bytes"
 	"fmt"
-	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -40,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Opts configures the watchdog.
@@ -77,7 +77,10 @@ var DefaultOpts = Opts{
 // trigger it.
 const descheduleThreshold = 1 * time.Second
 
-var stuckTasks = metric.MustCreateNewUint64Metric("/watchdog/stuck_tasks_detected", true /* sync */, "Cumulative count of stuck tasks detected")
+var (
+	stuckStartup = metric.MustCreateNewUint64Metric("/watchdog/stuck_startup_detected", true /* sync */, "Incremented once on startup watchdog timeout")
+	stuckTasks   = metric.MustCreateNewUint64Metric("/watchdog/stuck_tasks_detected", true /* sync */, "Cumulative count of stuck tasks detected")
+)
 
 // Amount of time to wait before dumping the stack to the log again when the same task(s) remains stuck.
 var stackDumpSameTaskPeriod = time.Minute
@@ -220,8 +223,11 @@ func (w *Watchdog) waitForStart() {
 		// We are fine.
 		return
 	}
+
+	stuckStartup.Increment()
+
 	var buf bytes.Buffer
-	buf.WriteString("Watchdog.Start() not called within %s:\n")
+	buf.WriteString(fmt.Sprintf("Watchdog.Start() not called within %s", w.StartupTimeout))
 	w.doAction(w.StartupTimeoutAction, false, &buf)
 }
 
@@ -255,7 +261,7 @@ func (w *Watchdog) runTurn() {
 	case <-done:
 	case <-time.After(w.TaskTimeout):
 		// Report if the watchdog is not making progress.
-		// No one is wathching the watchdog watcher though.
+		// No one is watching the watchdog watcher though.
 		w.reportStuckWatchdog()
 		<-done
 	}
@@ -317,28 +323,28 @@ func (w *Watchdog) report(offenders map[*kernel.Task]*offender, newTaskFound boo
 
 	buf.WriteString("Search for '(*Task).run(0x..., 0x<tid>)' in the stack dump to find the offending goroutine")
 
-	// Dump stack only if a new task is detected or if it sometime has
-	// passed since the last time a stack dump was generated.
-	skipStack := newTaskFound || time.Since(w.lastStackDump) >= stackDumpSameTaskPeriod
-	w.doAction(w.TaskTimeoutAction, skipStack, &buf)
+	// Force stack dump only if a new task is detected.
+	w.doAction(w.TaskTimeoutAction, newTaskFound, &buf)
 }
 
 func (w *Watchdog) reportStuckWatchdog() {
 	var buf bytes.Buffer
-	buf.WriteString("Watchdog goroutine is stuck:\n")
+	buf.WriteString("Watchdog goroutine is stuck")
 	w.doAction(w.TaskTimeoutAction, false, &buf)
 }
 
-// doAction will take the given action. If the action is LogWarnind and
-// skipStack is true, then the stack printing will be skipped.
-func (w *Watchdog) doAction(action Action, skipStack bool, msg *bytes.Buffer) {
+// doAction will take the given action. If the action is LogWarning, the stack
+// is not always dumped to the log to prevent log flooding. "forceStack"
+// guarantees that the stack will be dumped regardless.
+func (w *Watchdog) doAction(action Action, forceStack bool, msg *bytes.Buffer) {
 	switch action {
 	case LogWarning:
-		if skipStack {
+		// Dump stack only if forced or sometime has passed since the last time a
+		// stack dump was generated.
+		if !forceStack && time.Since(w.lastStackDump) < stackDumpSameTaskPeriod {
 			msg.WriteString("\n...[stack dump skipped]...")
 			log.Warningf(msg.String())
 			return
-
 		}
 		log.TracebackAll(msg.String())
 		w.lastStackDump = time.Now()
@@ -359,7 +365,8 @@ func (w *Watchdog) doAction(action Action, skipStack bool, msg *bytes.Buffer) {
 		case <-metricsEmitted:
 		case <-time.After(1 * time.Second):
 		}
-		panic(fmt.Sprintf("Stack for running G's are skipped while panicking.\n%s", msg.String()))
+		panic(fmt.Sprintf("%s\nStack for running G's are skipped while panicking.", msg.String()))
+
 	default:
 		panic(fmt.Sprintf("Unknown watchdog action %v", action))
 

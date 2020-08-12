@@ -1,4 +1,4 @@
-// Copyright 2019 Google Inc.
+// Copyright 2019 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,14 @@
 // +build arm64
 
 package ring0
+
+// HaltAndResume halts execution and point the pointer to the resume function.
+//go:nosplit
+func HaltAndResume()
+
+// HaltEl1SvcAndResume calls Hooks.KernelSyscall and resume.
+//go:nosplit
+func HaltEl1SvcAndResume()
 
 // init initializes architecture-specific state.
 func (k *Kernel) init(opts KernelOpts) {
@@ -48,9 +56,17 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	// Sanitize registers.
 	regs := switchOpts.Registers
 
-	regs.Pstate &= ^uint64(UserFlagsClear)
+	regs.Pstate &= ^uint64(PsrFlagsClear)
 	regs.Pstate |= UserFlagsSet
+
+	LoadFloatingPoint(switchOpts.FloatingPointState)
+	SetTLS(regs.TPIDR_EL0)
+
 	kernelExitToEl0()
+
+	regs.TPIDR_EL0 = GetTLS()
+	SaveFloatingPoint(switchOpts.FloatingPointState)
+
 	vector = c.vecCode
 
 	// Perform the switch.

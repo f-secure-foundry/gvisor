@@ -35,15 +35,17 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// Using header.IPv4AddressSize would cause an import cycle.
+const ipv4AddressSize = 4
 
 // Error represents an error in the netstack error space. Using a special type
 // ensures that errors outside of this space are not accidentally introduced.
@@ -112,6 +114,71 @@ var (
 	ErrAddressFamilyNotSupported = &Error{msg: "address family not supported by protocol"}
 )
 
+var messageToError map[string]*Error
+
+var populate sync.Once
+
+// StringToError converts an error message to the error.
+func StringToError(s string) *Error {
+	populate.Do(func() {
+		var errors = []*Error{
+			ErrUnknownProtocol,
+			ErrUnknownNICID,
+			ErrUnknownDevice,
+			ErrUnknownProtocolOption,
+			ErrDuplicateNICID,
+			ErrDuplicateAddress,
+			ErrNoRoute,
+			ErrBadLinkEndpoint,
+			ErrAlreadyBound,
+			ErrInvalidEndpointState,
+			ErrAlreadyConnecting,
+			ErrAlreadyConnected,
+			ErrNoPortAvailable,
+			ErrPortInUse,
+			ErrBadLocalAddress,
+			ErrClosedForSend,
+			ErrClosedForReceive,
+			ErrWouldBlock,
+			ErrConnectionRefused,
+			ErrTimeout,
+			ErrAborted,
+			ErrConnectStarted,
+			ErrDestinationRequired,
+			ErrNotSupported,
+			ErrQueueSizeNotSupported,
+			ErrNotConnected,
+			ErrConnectionReset,
+			ErrConnectionAborted,
+			ErrNoSuchFile,
+			ErrInvalidOptionValue,
+			ErrNoLinkAddress,
+			ErrBadAddress,
+			ErrNetworkUnreachable,
+			ErrMessageTooLong,
+			ErrNoBufferSpace,
+			ErrBroadcastDisabled,
+			ErrNotPermitted,
+			ErrAddressFamilyNotSupported,
+		}
+
+		messageToError = make(map[string]*Error)
+		for _, e := range errors {
+			if messageToError[e.String()] != nil {
+				panic("tcpip errors with duplicated message: " + e.String())
+			}
+			messageToError[e.String()] = e
+		}
+	})
+
+	e, ok := messageToError[s]
+	if !ok {
+		panic("unknown error message: " + s)
+	}
+
+	return e
+}
+
 // Errors related to Subnet
 var (
 	errSubnetLengthMismatch = errors.New("subnet length of address and mask differ")
@@ -129,7 +196,7 @@ func (e ErrSaveRejection) Error() string {
 	return "save rejected due to unsupported networking state: " + e.Err.Error()
 }
 
-// A Clock provides the current time.
+// A Clock provides the current time and schedules work for execution.
 //
 // Times returned by a Clock should always be used for application-visible
 // time. Only monotonic times should be used for netstack internal timekeeping.
@@ -140,6 +207,31 @@ type Clock interface {
 
 	// NowMonotonic returns a monotonic time value.
 	NowMonotonic() int64
+
+	// AfterFunc waits for the duration to elapse and then calls f in its own
+	// goroutine. It returns a Timer that can be used to cancel the call using
+	// its Stop method.
+	AfterFunc(d time.Duration, f func()) Timer
+}
+
+// Timer represents a single event. A Timer must be created with
+// Clock.AfterFunc.
+type Timer interface {
+	// Stop prevents the Timer from firing. It returns true if the call stops the
+	// timer, false if the timer has already expired or been stopped.
+	//
+	// If Stop returns false, then the timer has already expired and the function
+	// f of Clock.AfterFunc(d, f) has been started in its own goroutine; Stop
+	// does not wait for f to complete before returning. If the caller needs to
+	// know whether f is completed, it must coordinate with f explicitly.
+	Stop() bool
+
+	// Reset changes the timer to expire after duration d.
+	//
+	// Reset should be invoked only on stopped or expired timers. If the timer is
+	// known to have expired, Reset can be used directly. Otherwise, the caller
+	// must coordinate with the function f of Clock.AfterFunc(d, f).
+	Reset(d time.Duration)
 }
 
 // Address is a byte slice cast as a string that represents the address of a
@@ -232,6 +324,29 @@ func (s *Subnet) Broadcast() Address {
 	return Address(addr)
 }
 
+// IsBroadcast returns true if the address is considered a broadcast address.
+func (s *Subnet) IsBroadcast(address Address) bool {
+	// Only IPv4 supports the notion of a broadcast address.
+	if len(address) != ipv4AddressSize {
+		return false
+	}
+
+	// Normally, we would just compare address with the subnet's broadcast
+	// address but there is an exception where a simple comparison is not
+	// correct. This exception is for /31 and /32 IPv4 subnets where all
+	// addresses are considered valid host addresses.
+	//
+	// For /31 subnets, the case is easy. RFC 3021 Section 2.1 states that
+	// both addresses in a /31 subnet "MUST be interpreted as host addresses."
+	//
+	// For /32, the case is a bit more vague. RFC 3021 makes no mention of /32
+	// subnets. However, the same reasoning applies - if an exception is not
+	// made, then there do not exist any host addresses in a /32 subnet. RFC
+	// 4632 Section 3.1 also vaguely implies this interpretation by referring
+	// to addresses in /32 subnets as "host routes."
+	return s.Prefix() <= 30 && s.Broadcast() == address
+}
+
 // Equal returns true if s equals o.
 //
 // Needed to use cmp.Equal on Subnet as its fields are unexported.
@@ -251,6 +366,28 @@ type ShutdownFlags int
 const (
 	ShutdownRead ShutdownFlags = 1 << iota
 	ShutdownWrite
+)
+
+// PacketType is used to indicate the destination of the packet.
+type PacketType uint8
+
+const (
+	// PacketHost indicates a packet addressed to the local host.
+	PacketHost PacketType = iota
+
+	// PacketOtherHost indicates an outgoing packet addressed to
+	// another host caught by a NIC in promiscuous mode.
+	PacketOtherHost
+
+	// PacketOutgoing for a packet originating from the local host
+	// that is looped back to a packet socket.
+	PacketOutgoing
+
+	// PacketBroadcast indicates a link layer broadcast packet.
+	PacketBroadcast
+
+	// PacketMulticast indicates a link layer multicast packet.
+	PacketMulticast
 )
 
 // FullAddress represents a full transport node address, as required by the
@@ -323,13 +460,28 @@ type ControlMessages struct {
 	HasTOS bool
 
 	// TOS is the IPv4 type of service of the associated packet.
-	TOS int8
+	TOS uint8
 
-	// HasTClass indicates whether Tclass is valid/set.
+	// HasTClass indicates whether TClass is valid/set.
 	HasTClass bool
 
-	// Tclass is the IPv6 traffic class of the associated packet.
-	TClass int32
+	// TClass is the IPv6 traffic class of the associated packet.
+	TClass uint32
+
+	// HasIPPacketInfo indicates whether PacketInfo is set.
+	HasIPPacketInfo bool
+
+	// PacketInfo holds interface and address data on an incoming packet.
+	PacketInfo IPPacketInfo
+}
+
+// PacketOwner is used to get UID and GID of the packet.
+type PacketOwner interface {
+	// UID returns UID of the packet.
+	UID() uint32
+
+	// GID returns GID of the packet.
+	GID() uint32
 }
 
 // Endpoint is the interface implemented by transport protocols (e.g., tcp, udp)
@@ -337,8 +489,14 @@ type ControlMessages struct {
 // networking stack.
 type Endpoint interface {
 	// Close puts the endpoint in a closed state and frees all resources
-	// associated with it.
+	// associated with it. Close initiates the teardown process, the
+	// Endpoint may not be fully closed when Close returns.
 	Close()
+
+	// Abort initiates an expedited endpoint teardown. As compared to
+	// Close, Abort prioritizes closing the Endpoint quickly over cleanly.
+	// Abort is best effort; implementing Abort with Close is acceptable.
+	Abort()
 
 	// Read reads data from the endpoint and optionally returns the sender.
 	//
@@ -424,17 +582,25 @@ type Endpoint interface {
 	// SetSockOpt sets a socket option. opt should be one of the *Option types.
 	SetSockOpt(opt interface{}) *Error
 
+	// SetSockOptBool sets a socket option, for simple cases where a value
+	// has the bool type.
+	SetSockOptBool(opt SockOptBool, v bool) *Error
+
 	// SetSockOptInt sets a socket option, for simple cases where a value
 	// has the int type.
-	SetSockOptInt(opt SockOpt, v int) *Error
+	SetSockOptInt(opt SockOptInt, v int) *Error
 
 	// GetSockOpt gets a socket option. opt should be a pointer to one of the
 	// *Option types.
 	GetSockOpt(opt interface{}) *Error
 
+	// GetSockOptBool gets a socket option for simple cases where a return
+	// value has the bool type.
+	GetSockOptBool(SockOptBool) (bool, *Error)
+
 	// GetSockOptInt gets a socket option for simple cases where a return
 	// value has the int type.
-	GetSockOptInt(SockOpt) (int, *Error)
+	GetSockOptInt(SockOptInt) (int, *Error)
 
 	// State returns a socket's lifecycle state. The returned value is
 	// protocol-specific and is primarily used for diagnostics.
@@ -447,14 +613,36 @@ type Endpoint interface {
 	// NOTE: This method is a no-op for sockets other than TCP.
 	ModerateRecvBuf(copied int)
 
-	// IPTables returns the iptables for this endpoint's stack.
-	IPTables() (iptables.IPTables, error)
-
 	// Info returns a copy to the transport endpoint info.
 	Info() EndpointInfo
 
 	// Stats returns a reference to the endpoint stats.
 	Stats() EndpointStats
+
+	// SetOwner sets the task owner to the endpoint owner.
+	SetOwner(owner PacketOwner)
+}
+
+// LinkPacketInfo holds Link layer information for a received packet.
+//
+// +stateify savable
+type LinkPacketInfo struct {
+	// Protocol is the NetworkProtocolNumber for the packet.
+	Protocol NetworkProtocolNumber
+
+	// PktType is used to indicate the destination of the packet.
+	PktType PacketType
+}
+
+// PacketEndpoint are additional methods that are only implemented by Packet
+// endpoints.
+type PacketEndpoint interface {
+	// ReadPacket reads a datagram/packet from the endpoint and optionally
+	// returns the sender and additional LinkPacketInfo.
+	//
+	// This method does not block if there is no data pending. It will also
+	// either return an error or data, never both.
+	ReadPacket(*FullAddress, *LinkPacketInfo) (buffer.View, ControlMessages, *Error)
 }
 
 // EndpointInfo is the interface implemented by each endpoint info struct.
@@ -489,13 +677,117 @@ type WriteOptions struct {
 	Atomic bool
 }
 
-// SockOpt represents socket options which values have the int type.
-type SockOpt int
+// SockOptBool represents socket options which values have the bool type.
+type SockOptBool int
 
 const (
+	// BroadcastOption is used by SetSockOptBool/GetSockOptBool to specify
+	// whether datagram sockets are allowed to send packets to a broadcast
+	// address.
+	BroadcastOption SockOptBool = iota
+
+	// CorkOption is used by SetSockOptBool/GetSockOptBool to specify if
+	// data should be held until segments are full by the TCP transport
+	// protocol.
+	CorkOption
+
+	// DelayOption is used by SetSockOptBool/GetSockOptBool to specify if
+	// data should be sent out immediately by the transport protocol. For
+	// TCP, it determines if the Nagle algorithm is on or off.
+	DelayOption
+
+	// KeepaliveEnabledOption is used by SetSockOptBool/GetSockOptBool to
+	// specify whether TCP keepalive is enabled for this socket.
+	KeepaliveEnabledOption
+
+	// MulticastLoopOption is used by SetSockOptBool/GetSockOptBool to
+	// specify whether multicast packets sent over a non-loopback interface
+	// will be looped back.
+	MulticastLoopOption
+
+	// NoChecksumOption is used by SetSockOptBool/GetSockOptBool to specify
+	// whether UDP checksum is disabled for this socket.
+	NoChecksumOption
+
+	// PasscredOption is used by SetSockOptBool/GetSockOptBool to specify
+	// whether SCM_CREDENTIALS socket control messages are enabled.
+	//
+	// Only supported on Unix sockets.
+	PasscredOption
+
+	// QuickAckOption is stubbed out in SetSockOptBool/GetSockOptBool.
+	QuickAckOption
+
+	// ReceiveTClassOption is used by SetSockOptBool/GetSockOptBool to
+	// specify if the IPV6_TCLASS ancillary message is passed with incoming
+	// packets.
+	ReceiveTClassOption
+
+	// ReceiveTOSOption is used by SetSockOptBool/GetSockOptBool to specify
+	// if the TOS ancillary message is passed with incoming packets.
+	ReceiveTOSOption
+
+	// ReceiveIPPacketInfoOption is used by SetSockOptBool/GetSockOptBool to
+	// specify if more inforamtion is provided with incoming packets such as
+	// interface index and address.
+	ReceiveIPPacketInfoOption
+
+	// ReuseAddressOption is used by SetSockOptBool/GetSockOptBool to
+	// specify whether Bind() should allow reuse of local address.
+	ReuseAddressOption
+
+	// ReusePortOption is used by SetSockOptBool/GetSockOptBool to permit
+	// multiple sockets to be bound to an identical socket address.
+	ReusePortOption
+
+	// V6OnlyOption is used by SetSockOptBool/GetSockOptBool to specify
+	// whether an IPv6 socket is to be restricted to sending and receiving
+	// IPv6 packets only.
+	V6OnlyOption
+
+	// IPHdrIncludedOption is used by SetSockOpt to indicate for a raw
+	// endpoint that all packets being written have an IP header and the
+	// endpoint should not attach an IP header.
+	IPHdrIncludedOption
+)
+
+// SockOptInt represents socket options which values have the int type.
+type SockOptInt int
+
+const (
+	// KeepaliveCountOption is used by SetSockOptInt/GetSockOptInt to
+	// specify the number of un-ACKed TCP keepalives that will be sent
+	// before the connection is closed.
+	KeepaliveCountOption SockOptInt = iota
+
+	// IPv4TOSOption is used by SetSockOptInt/GetSockOptInt to specify TOS
+	// for all subsequent outgoing IPv4 packets from the endpoint.
+	IPv4TOSOption
+
+	// IPv6TrafficClassOption is used by SetSockOptInt/GetSockOptInt to
+	// specify TOS for all subsequent outgoing IPv6 packets from the
+	// endpoint.
+	IPv6TrafficClassOption
+
+	// MaxSegOption is used by SetSockOptInt/GetSockOptInt to set/get the
+	// current Maximum Segment Size(MSS) value as specified using the
+	// TCP_MAXSEG option.
+	MaxSegOption
+
+	// MTUDiscoverOption is used to set/get the path MTU discovery setting.
+	//
+	// NOTE: Setting this option to any other value than PMTUDiscoveryDont
+	// is not supported and will fail as such, and getting this option will
+	// always return PMTUDiscoveryDont.
+	MTUDiscoverOption
+
+	// MulticastTTLOption is used by SetSockOptInt/GetSockOptInt to control
+	// the default TTL value for multicast messages. The default is 1.
+	MulticastTTLOption
+
 	// ReceiveQueueSizeOption is used in GetSockOptInt to specify that the
 	// number of unread bytes in the input buffer should be returned.
-	ReceiveQueueSizeOption SockOpt = iota
+	ReceiveQueueSizeOption
 
 	// SendBufferSizeOption is used by SetSockOptInt/GetSockOptInt to
 	// specify the send buffer size option.
@@ -509,47 +801,52 @@ const (
 	// number of unread bytes in the output buffer should be returned.
 	SendQueueSizeOption
 
-	// DelayOption is used by SetSockOpt/GetSockOpt to specify if data
-	// should be sent out immediately by the transport protocol. For TCP,
-	// it determines if the Nagle algorithm is on or off.
-	DelayOption
+	// TTLOption is used by SetSockOptInt/GetSockOptInt to control the
+	// default TTL/hop limit value for unicast messages. The default is
+	// protocol specific.
+	//
+	// A zero value indicates the default.
+	TTLOption
 
-	// TODO(b/137664753): convert all int socket options to be handled via
-	// GetSockOptInt.
+	// TCPSynCountOption is used by SetSockOptInt/GetSockOptInt to specify
+	// the number of SYN retransmits that TCP should send before aborting
+	// the attempt to connect. It cannot exceed 255.
+	//
+	// NOTE: This option is currently only stubbed out and is no-op.
+	TCPSynCountOption
+
+	// TCPWindowClampOption is used by SetSockOptInt/GetSockOptInt to bound
+	// the size of the advertised window to this value.
+	//
+	// NOTE: This option is currently only stubed out and is a no-op
+	TCPWindowClampOption
+)
+
+const (
+	// PMTUDiscoveryWant is a setting of the MTUDiscoverOption to use
+	// per-route settings.
+	PMTUDiscoveryWant int = iota
+
+	// PMTUDiscoveryDont is a setting of the MTUDiscoverOption to disable
+	// path MTU discovery.
+	PMTUDiscoveryDont
+
+	// PMTUDiscoveryDo is a setting of the MTUDiscoverOption to always do
+	// path MTU discovery.
+	PMTUDiscoveryDo
+
+	// PMTUDiscoveryProbe is a setting of the MTUDiscoverOption to set DF
+	// but ignore path MTU.
+	PMTUDiscoveryProbe
 )
 
 // ErrorOption is used in GetSockOpt to specify that the last error reported by
 // the endpoint should be cleared and returned.
 type ErrorOption struct{}
 
-// V6OnlyOption is used by SetSockOpt/GetSockOpt to specify whether an IPv6
-// socket is to be restricted to sending and receiving IPv6 packets only.
-type V6OnlyOption int
-
-// CorkOption is used by SetSockOpt/GetSockOpt to specify if data should be
-// held until segments are full by the TCP transport protocol.
-type CorkOption int
-
-// ReuseAddressOption is used by SetSockOpt/GetSockOpt to specify whether Bind()
-// should allow reuse of local address.
-type ReuseAddressOption int
-
-// ReusePortOption is used by SetSockOpt/GetSockOpt to permit multiple sockets
-// to be bound to an identical socket address.
-type ReusePortOption int
-
 // BindToDeviceOption is used by SetSockOpt/GetSockOpt to specify that sockets
 // should bind only on a specific NIC.
-type BindToDeviceOption string
-
-// QuickAckOption is stubbed out in SetSockOpt/GetSockOpt.
-type QuickAckOption int
-
-// PasscredOption is used by SetSockOpt/GetSockOpt to specify whether
-// SCM_CREDENTIALS socket control messages are enabled.
-//
-// Only supported on Unix sockets.
-type PasscredOption int
+type BindToDeviceOption NICID
 
 // TCPInfoOption is used by GetSockOpt to expose TCP statistics.
 //
@@ -559,10 +856,6 @@ type TCPInfoOption struct {
 	RTTVar time.Duration
 }
 
-// KeepaliveEnabledOption is used by SetSockOpt/GetSockOpt to specify whether
-// TCP keepalive is enabled for this socket.
-type KeepaliveEnabledOption int
-
 // KeepaliveIdleOption is used by SetSockOpt/GetSockOpt to specify the time a
 // connection must remain idle before the first TCP keepalive packet is sent.
 // Once this time is reached, KeepaliveIntervalOption is used instead.
@@ -571,11 +864,6 @@ type KeepaliveIdleOption time.Duration
 // KeepaliveIntervalOption is used by SetSockOpt/GetSockOpt to specify the
 // interval between sending TCP keepalive packets.
 type KeepaliveIntervalOption time.Duration
-
-// KeepaliveCountOption is used by SetSockOpt/GetSockOpt to specify the number
-// of un-ACKed TCP keepalives that will be sent before the connection is
-// closed.
-type KeepaliveCountOption int
 
 // TCPUserTimeoutOption is used by SetSockOpt/GetSockOpt to specify a user
 // specified timeout for a given TCP connection.
@@ -590,19 +878,8 @@ type CongestionControlOption string
 // control algorithms.
 type AvailableCongestionControlOption string
 
-// ModerateReceiveBufferOption allows the caller to enable/disable TCP receive
-// buffer moderation.
+// ModerateReceiveBufferOption is used by buffer moderation.
 type ModerateReceiveBufferOption bool
-
-// MaxSegOption is used by SetSockOpt/GetSockOpt to set/get the current
-// Maximum Segment Size(MSS) value as specified using the TCP_MAXSEG option.
-type MaxSegOption int
-
-// TTLOption is used by SetSockOpt/GetSockOpt to control the default TTL/hop
-// limit value for unicast messages. The default is protocol specific.
-//
-// A zero value indicates the default.
-type TTLOption uint8
 
 // TCPLingerTimeoutOption is used by SetSockOpt/GetSockOpt to set/get the
 // maximum duration for which a socket lingers in the TCP_FIN_WAIT_2 state
@@ -614,9 +891,32 @@ type TCPLingerTimeoutOption time.Duration
 // before being marked closed.
 type TCPTimeWaitTimeoutOption time.Duration
 
-// MulticastTTLOption is used by SetSockOpt/GetSockOpt to control the default
-// TTL value for multicast messages. The default is 1.
-type MulticastTTLOption uint8
+// TCPDeferAcceptOption is used by SetSockOpt/GetSockOpt to allow a
+// accept to return a completed connection only when there is data to be
+// read. This usually means the listening socket will drop the final ACK
+// for a handshake till the specified timeout until a segment with data arrives.
+type TCPDeferAcceptOption time.Duration
+
+// TCPMinRTOOption is use by SetSockOpt/GetSockOpt to allow overriding
+// default MinRTO used by the Stack.
+type TCPMinRTOOption time.Duration
+
+// TCPMaxRTOOption is use by SetSockOpt/GetSockOpt to allow overriding
+// default MaxRTO used by the Stack.
+type TCPMaxRTOOption time.Duration
+
+// TCPMaxRetriesOption is used by SetSockOpt/GetSockOpt to set/get the
+// maximum number of retransmits after which we time out the connection.
+type TCPMaxRetriesOption uint64
+
+// TCPSynRcvdCountThresholdOption is used by SetSockOpt/GetSockOpt to specify
+// the number of endpoints that can be in SYN-RCVD state before the stack
+// switches to using SYN cookies.
+type TCPSynRcvdCountThresholdOption uint64
+
+// TCPSynRetriesOption is used by SetSockOpt/GetSockOpt to specify stack-wide
+// default for number of times SYN is retransmitted before aborting a connect.
+type TCPSynRetriesOption uint8
 
 // MulticastInterfaceOption is used by SetSockOpt/GetSockOpt to specify a
 // default interface for multicast.
@@ -624,10 +924,6 @@ type MulticastInterfaceOption struct {
 	NIC           NICID
 	InterfaceAddr Address
 }
-
-// MulticastLoopOption is used by SetSockOpt/GetSockOpt to specify whether
-// multicast packets sent over a non-loopback interface will be looped back.
-type MulticastLoopOption bool
 
 // MembershipOption is used by SetSockOpt/GetSockOpt as an argument to
 // AddMembershipOption and RemoveMembershipOption.
@@ -651,21 +947,31 @@ type RemoveMembershipOption MembershipOption
 // TCP out-of-band data is delivered along with the normal in-band data.
 type OutOfBandInlineOption int
 
-// BroadcastOption is used by SetSockOpt/GetSockOpt to specify whether
-// datagram sockets are allowed to send packets to a broadcast address.
-type BroadcastOption int
-
 // DefaultTTLOption is used by stack.(*Stack).NetworkProtocolOption to specify
 // a default TTL.
 type DefaultTTLOption uint8
 
-// IPv4TOSOption is used by SetSockOpt/GetSockOpt to specify TOS
-// for all subsequent outgoing IPv4 packets from the endpoint.
-type IPv4TOSOption uint8
+// SocketDetachFilterOption is used by SetSockOpt to detach a previously attached
+// classic BPF filter on a given endpoint.
+type SocketDetachFilterOption int
 
-// IPv6TrafficClassOption is used by SetSockOpt/GetSockOpt to specify TOS
-// for all subsequent outgoing IPv6 packets from the endpoint.
-type IPv6TrafficClassOption uint8
+// OriginalDestinationOption is used to get the original destination address
+// and port of a redirected packet.
+type OriginalDestinationOption FullAddress
+
+// IPPacketInfo is the message structure for IP_PKTINFO.
+//
+// +stateify savable
+type IPPacketInfo struct {
+	// NIC is the ID of the NIC to be used.
+	NIC NICID
+
+	// LocalAddr is the local address.
+	LocalAddr Address
+
+	// DestinationAddr is the destination address found in the IP header.
+	DestinationAddr Address
+}
 
 // Route is a row in the routing table. It specifies through which NIC (and
 // gateway) sets of packets should be routed. A row is considered viable if the
@@ -895,9 +1201,13 @@ type IPStats struct {
 	// link layer in nic.DeliverNetworkPacket.
 	PacketsReceived *StatCounter
 
-	// InvalidAddressesReceived is the total number of IP packets received
-	// with an unknown or invalid destination address.
-	InvalidAddressesReceived *StatCounter
+	// InvalidDestinationAddressesReceived is the total number of IP packets
+	// received with an unknown or invalid destination address.
+	InvalidDestinationAddressesReceived *StatCounter
+
+	// InvalidSourceAddressesReceived is the total number of IP packets received
+	// with a source address that should never have been received on the wire.
+	InvalidSourceAddressesReceived *StatCounter
 
 	// PacketsDelivered is the total number of incoming IP packets that
 	// are successfully delivered to the transport layer via HandlePacket.
@@ -930,8 +1240,12 @@ type TCPStats struct {
 	PassiveConnectionOpenings *StatCounter
 
 	// CurrentEstablished is the number of TCP connections for which the
-	// current state is either ESTABLISHED or CLOSE-WAIT.
+	// current state is ESTABLISHED.
 	CurrentEstablished *StatCounter
+
+	// CurrentConnected is the number of TCP connections that
+	// are in connected state.
+	CurrentConnected *StatCounter
 
 	// EstablishedResets is the number of times TCP connections have made
 	// a direct transition to the CLOSED state from either the
@@ -1038,6 +1352,12 @@ type UDPStats struct {
 
 	// PacketSendErrors is the number of datagrams failed to be sent.
 	PacketSendErrors *StatCounter
+
+	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
+	ChecksumErrors *StatCounter
+
+	// InvalidSourceAddress is the number of invalid sourced datagrams dropped.
+	InvalidSourceAddress *StatCounter
 }
 
 // Stats holds statistics about the networking stack.
@@ -1081,6 +1401,9 @@ type ReceiveErrors struct {
 	// ClosedReceiver is the number of received packets dropped because
 	// of receiving endpoint state being closed.
 	ClosedReceiver StatCounter
+
+	// ChecksumErrors is the number of packets dropped due to bad checksums.
+	ChecksumErrors StatCounter
 }
 
 // SendErrors collects packet send errors within the transport layer for
@@ -1106,6 +1429,10 @@ type ReadErrors struct {
 	// InvalidEndpointState is the number of times we found the endpoint state
 	// to be unexpected.
 	InvalidEndpointState StatCounter
+
+	// NotConnected is the number of times we tried to read but found that the
+	// endpoint was not connected.
+	NotConnected StatCounter
 }
 
 // WriteErrors collects packet write errors from an endpoint write call.
@@ -1148,7 +1475,9 @@ type TransportEndpointStats struct {
 // marker interface.
 func (*TransportEndpointStats) IsEndpointStats() {}
 
-func fillIn(v reflect.Value) {
+// InitStatCounters initializes v's fields with nil StatCounter fields to new
+// StatCounters.
+func InitStatCounters(v reflect.Value) {
 	for i := 0; i < v.NumField(); i++ {
 		v := v.Field(i)
 		if s, ok := v.Addr().Interface().(**StatCounter); ok {
@@ -1156,14 +1485,14 @@ func fillIn(v reflect.Value) {
 				*s = new(StatCounter)
 			}
 		} else {
-			fillIn(v)
+			InitStatCounters(v)
 		}
 	}
 }
 
 // FillIn returns a copy of s with nil fields initialized to new StatCounters.
 func (s Stats) FillIn() Stats {
-	fillIn(reflect.ValueOf(&s).Elem())
+	InitStatCounters(reflect.ValueOf(&s).Elem())
 	return s
 }
 

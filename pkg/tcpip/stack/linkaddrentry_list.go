@@ -52,11 +52,21 @@ func (l *linkAddrEntryList) Back() *linkAddrEntry {
 	return l.tail
 }
 
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+func (l *linkAddrEntryList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (linkAddrEntryElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
+
 // PushFront inserts the element e at the front of list l.
 func (l *linkAddrEntryList) PushFront(e *linkAddrEntry) {
-	linkAddrEntryElementMapper{}.linkerFor(e).SetNext(l.head)
-	linkAddrEntryElementMapper{}.linkerFor(e).SetPrev(nil)
-
+	linker := linkAddrEntryElementMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
 		linkAddrEntryElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -68,9 +78,9 @@ func (l *linkAddrEntryList) PushFront(e *linkAddrEntry) {
 
 // PushBack inserts the element e at the back of list l.
 func (l *linkAddrEntryList) PushBack(e *linkAddrEntry) {
-	linkAddrEntryElementMapper{}.linkerFor(e).SetNext(nil)
-	linkAddrEntryElementMapper{}.linkerFor(e).SetPrev(l.tail)
-
+	linker := linkAddrEntryElementMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
 		linkAddrEntryElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -91,17 +101,20 @@ func (l *linkAddrEntryList) PushBackList(m *linkAddrEntryList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
 func (l *linkAddrEntryList) InsertAfter(b, e *linkAddrEntry) {
-	a := linkAddrEntryElementMapper{}.linkerFor(b).Next()
-	linkAddrEntryElementMapper{}.linkerFor(e).SetNext(a)
-	linkAddrEntryElementMapper{}.linkerFor(e).SetPrev(b)
-	linkAddrEntryElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := linkAddrEntryElementMapper{}.linkerFor(b)
+	eLinker := linkAddrEntryElementMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
 		linkAddrEntryElementMapper{}.linkerFor(a).SetPrev(e)
@@ -112,10 +125,13 @@ func (l *linkAddrEntryList) InsertAfter(b, e *linkAddrEntry) {
 
 // InsertBefore inserts e before a.
 func (l *linkAddrEntryList) InsertBefore(a, e *linkAddrEntry) {
-	b := linkAddrEntryElementMapper{}.linkerFor(a).Prev()
-	linkAddrEntryElementMapper{}.linkerFor(e).SetNext(a)
-	linkAddrEntryElementMapper{}.linkerFor(e).SetPrev(b)
-	linkAddrEntryElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := linkAddrEntryElementMapper{}.linkerFor(a)
+	eLinker := linkAddrEntryElementMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
 		linkAddrEntryElementMapper{}.linkerFor(b).SetNext(e)
@@ -126,20 +142,24 @@ func (l *linkAddrEntryList) InsertBefore(a, e *linkAddrEntry) {
 
 // Remove removes e from l.
 func (l *linkAddrEntryList) Remove(e *linkAddrEntry) {
-	prev := linkAddrEntryElementMapper{}.linkerFor(e).Prev()
-	next := linkAddrEntryElementMapper{}.linkerFor(e).Next()
+	linker := linkAddrEntryElementMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
 		linkAddrEntryElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		linkAddrEntryElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields

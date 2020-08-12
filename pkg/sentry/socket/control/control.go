@@ -19,14 +19,15 @@ package control
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/binary"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 const maxInt = int(^uint(0) >> 1)
@@ -39,6 +40,8 @@ type SCMCredentials interface {
 	// and gid.
 	Credentials(t *kernel.Task) (kernel.ThreadID, auth.UID, auth.GID)
 }
+
+// LINT.IfChange
 
 // SCMRights represents a SCM_RIGHTS socket control message.
 type SCMRights interface {
@@ -65,7 +68,7 @@ func NewSCMRights(t *kernel.Task, fds []int32) (SCMRights, error) {
 	for _, fd := range fds {
 		file := t.GetFile(fd)
 		if file == nil {
-			files.Release()
+			files.Release(t)
 			return nil, syserror.EBADF
 		}
 		files = append(files, file)
@@ -97,9 +100,9 @@ func (fs *RightsFiles) Clone() transport.RightsControlMessage {
 }
 
 // Release implements transport.RightsControlMessage.Release.
-func (fs *RightsFiles) Release() {
+func (fs *RightsFiles) Release(ctx context.Context) {
 	for _, f := range *fs {
-		f.DecRef()
+		f.DecRef(ctx)
 	}
 	*fs = nil
 }
@@ -112,7 +115,7 @@ func rightsFDs(t *kernel.Task, rights SCMRights, cloexec bool, max int) ([]int32
 		fd, err := t.NewFDFrom(0, files[0], kernel.FDFlags{
 			CloseOnExec: cloexec,
 		})
-		files[0].DecRef()
+		files[0].DecRef(t)
 		files = files[1:]
 		if err != nil {
 			t.Warningf("Error inserting FD: %v", err)
@@ -140,6 +143,8 @@ func PackRights(t *kernel.Task, rights SCMRights, cloexec bool, buf []byte, flag
 	align := t.Arch().Width()
 	return putCmsg(buf, flags, linux.SCM_RIGHTS, align, fds)
 }
+
+// LINT.ThenChange(./control_vfs2.go)
 
 // scmCredentials represents an SCM_CREDENTIALS socket control message.
 //
@@ -189,7 +194,7 @@ func putUint32(buf []byte, n uint32) []byte {
 // putCmsg writes a control message header and as much data as will fit into
 // the unused capacity of a buffer.
 func putCmsg(buf []byte, flags int, msgType uint32, align uint, data []int32) ([]byte, int) {
-	space := AlignDown(cap(buf)-len(buf), 4)
+	space := binary.AlignDown(cap(buf)-len(buf), 4)
 
 	// We can't write to space that doesn't exist, so if we are going to align
 	// the available space, we must align down.
@@ -282,19 +287,9 @@ func PackCredentials(t *kernel.Task, creds SCMCredentials, buf []byte, flags int
 	return putCmsg(buf, flags, linux.SCM_CREDENTIALS, align, c)
 }
 
-// AlignUp rounds a length up to an alignment. align must be a power of 2.
-func AlignUp(length int, align uint) int {
-	return (length + int(align) - 1) & ^(int(align) - 1)
-}
-
-// AlignDown rounds a down to an alignment. align must be a power of 2.
-func AlignDown(length int, align uint) int {
-	return length & ^(int(align) - 1)
-}
-
 // alignSlice extends a slice's length (up to the capacity) to align it.
 func alignSlice(buf []byte, align uint) []byte {
-	aligned := AlignUp(len(buf), align)
+	aligned := binary.AlignUp(len(buf), align)
 	if aligned > cap(buf) {
 		// Linux allows unaligned data if there isn't room for alignment.
 		// Since there isn't room for alignment, there isn't room for any
@@ -327,7 +322,7 @@ func PackInq(t *kernel.Task, inq int32, buf []byte) []byte {
 }
 
 // PackTOS packs an IP_TOS socket control message.
-func PackTOS(t *kernel.Task, tos int8, buf []byte) []byte {
+func PackTOS(t *kernel.Task, tos uint8, buf []byte) []byte {
 	return putCmsgStruct(
 		buf,
 		linux.SOL_IP,
@@ -338,13 +333,29 @@ func PackTOS(t *kernel.Task, tos int8, buf []byte) []byte {
 }
 
 // PackTClass packs an IPV6_TCLASS socket control message.
-func PackTClass(t *kernel.Task, tClass int32, buf []byte) []byte {
+func PackTClass(t *kernel.Task, tClass uint32, buf []byte) []byte {
 	return putCmsgStruct(
 		buf,
 		linux.SOL_IPV6,
 		linux.IPV6_TCLASS,
 		t.Arch().Width(),
 		tClass,
+	)
+}
+
+// PackIPPacketInfo packs an IP_PKTINFO socket control message.
+func PackIPPacketInfo(t *kernel.Task, packetInfo tcpip.IPPacketInfo, buf []byte) []byte {
+	var p linux.ControlMessageIPPacketInfo
+	p.NIC = int32(packetInfo.NIC)
+	copy(p.LocalAddr[:], []byte(packetInfo.LocalAddr))
+	copy(p.DestinationAddr[:], []byte(packetInfo.DestinationAddr))
+
+	return putCmsgStruct(
+		buf,
+		linux.SOL_IP,
+		linux.IP_PKTINFO,
+		t.Arch().Width(),
+		p,
 	)
 }
 
@@ -372,12 +383,16 @@ func PackControlMessages(t *kernel.Task, cmsgs socket.ControlMessages, buf []byt
 		buf = PackTClass(t, cmsgs.IP.TClass, buf)
 	}
 
+	if cmsgs.IP.HasIPPacketInfo {
+		buf = PackIPPacketInfo(t, cmsgs.IP.PacketInfo, buf)
+	}
+
 	return buf
 }
 
 // cmsgSpace is equivalent to CMSG_SPACE in Linux.
 func cmsgSpace(t *kernel.Task, dataLen int) int {
-	return linux.SizeOfControlMessageHeader + AlignUp(dataLen, t.Arch().Width())
+	return linux.SizeOfControlMessageHeader + binary.AlignUp(dataLen, t.Arch().Width())
 }
 
 // CmsgsSpace returns the number of bytes needed to fit the control messages
@@ -402,6 +417,16 @@ func CmsgsSpace(t *kernel.Task, cmsgs socket.ControlMessages) int {
 	}
 
 	return space
+}
+
+// NewIPPacketInfo returns the IPPacketInfo struct.
+func NewIPPacketInfo(packetInfo linux.ControlMessageIPPacketInfo) tcpip.IPPacketInfo {
+	var p tcpip.IPPacketInfo
+	p.NIC = tcpip.NICID(packetInfo.NIC)
+	copy([]byte(p.LocalAddr), packetInfo.LocalAddr[:])
+	copy([]byte(p.DestinationAddr), packetInfo.DestinationAddr[:])
+
+	return p
 }
 
 // Parse parses a raw socket control message into portable objects.
@@ -437,7 +462,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 		case linux.SOL_SOCKET:
 			switch h.Type {
 			case linux.SCM_RIGHTS:
-				rightsSize := AlignDown(length, linux.SizeOfControlMessageRight)
+				rightsSize := binary.AlignDown(length, linux.SizeOfControlMessageRight)
 				numRights := rightsSize / linux.SizeOfControlMessageRight
 
 				if len(fds)+numRights > linux.SCM_MAX_FD {
@@ -448,7 +473,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 					fds = append(fds, int32(usermem.ByteOrder.Uint32(buf[j:j+linux.SizeOfControlMessageRight])))
 				}
 
-				i += AlignUp(length, width)
+				i += binary.AlignUp(length, width)
 
 			case linux.SCM_CREDENTIALS:
 				if length < linux.SizeOfControlMessageCredentials {
@@ -462,7 +487,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 					return socket.ControlMessages{}, err
 				}
 				cmsgs.Unix.Credentials = scmCreds
-				i += AlignUp(length, width)
+				i += binary.AlignUp(length, width)
 
 			default:
 				// Unknown message type.
@@ -471,9 +496,24 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 		case linux.SOL_IP:
 			switch h.Type {
 			case linux.IP_TOS:
+				if length < linux.SizeOfControlMessageTOS {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
 				cmsgs.IP.HasTOS = true
 				binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageTOS], usermem.ByteOrder, &cmsgs.IP.TOS)
-				i += AlignUp(length, width)
+				i += binary.AlignUp(length, width)
+
+			case linux.IP_PKTINFO:
+				if length < linux.SizeOfControlMessageIPPacketInfo {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+
+				cmsgs.IP.HasIPPacketInfo = true
+				var packetInfo linux.ControlMessageIPPacketInfo
+				binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageIPPacketInfo], usermem.ByteOrder, &packetInfo)
+
+				cmsgs.IP.PacketInfo = NewIPPacketInfo(packetInfo)
+				i += binary.AlignUp(length, width)
 
 			default:
 				return socket.ControlMessages{}, syserror.EINVAL
@@ -481,9 +521,12 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 		case linux.SOL_IPV6:
 			switch h.Type {
 			case linux.IPV6_TCLASS:
+				if length < linux.SizeOfControlMessageTClass {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
 				cmsgs.IP.HasTClass = true
 				binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageTClass], usermem.ByteOrder, &cmsgs.IP.TClass)
-				i += AlignUp(length, width)
+				i += binary.AlignUp(length, width)
 
 			default:
 				return socket.ControlMessages{}, syserror.EINVAL
@@ -498,11 +541,19 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 	}
 
 	if len(fds) > 0 {
-		rights, err := NewSCMRights(t, fds)
-		if err != nil {
-			return socket.ControlMessages{}, err
+		if kernel.VFS2Enabled {
+			rights, err := NewSCMRightsVFS2(t, fds)
+			if err != nil {
+				return socket.ControlMessages{}, err
+			}
+			cmsgs.Unix.Rights = rights
+		} else {
+			rights, err := NewSCMRights(t, fds)
+			if err != nil {
+				return socket.ControlMessages{}, err
+			}
+			cmsgs.Unix.Rights = rights
 		}
-		cmsgs.Unix.Rights = rights
 	}
 
 	return cmsgs, nil
@@ -527,6 +578,8 @@ func MakeCreds(t *kernel.Task) SCMCredentials {
 	return &scmCredentials{t, tcred.EffectiveKUID, tcred.EffectiveKGID}
 }
 
+// LINT.IfChange
+
 // New creates default control messages if needed.
 func New(t *kernel.Task, socketOrEndpoint interface{}, rights SCMRights) transport.ControlMessages {
 	return transport.ControlMessages{
@@ -534,3 +587,5 @@ func New(t *kernel.Task, socketOrEndpoint interface{}, rights SCMRights) transpo
 		Rights:      rights,
 	}
 }
+
+// LINT.ThenChange(./control_vfs2.go)

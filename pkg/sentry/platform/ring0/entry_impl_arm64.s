@@ -89,10 +89,14 @@
 // not available for calls.
 //
 
+// ERET returns using the ELR and SPSR for the current exception level.
 #define ERET() \
   WORD $0xd69f03e0
 
+// RSV_REG is a register that holds el1 information temporarily.
 #define RSV_REG 	R18_PLATFORM
+
+// RSV_REG_APP is a register that holds el0 information temporarily.
 #define RSV_REG_APP 	R9
 
 #define FPEN_NOTRAP 	0x3
@@ -100,6 +104,26 @@
 
 #define FPEN_ENABLE (FPEN_NOTRAP << FPEN_SHIFT)
 
+// sctlr_el1: system control register el1.
+#define SCTLR_M         1 << 0
+#define SCTLR_C         1 << 2
+#define SCTLR_I         1 << 12
+#define SCTLR_UCT       1 << 15
+
+#define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT)
+
+// cntkctl_el1: counter-timer kernel control register el1.
+#define CNTKCTL_EL0PCTEN 	1 << 0
+#define CNTKCTL_EL0VCTEN 	1 << 1
+
+#define CNTKCTL_EL1_DEFAULT 	(CNTKCTL_EL0PCTEN | CNTKCTL_EL0VCTEN)
+
+// Saves a register set.
+//
+// This is a macro because it may need to executed in contents where a stack is
+// not available for calls.
+//
+// The following registers are not saved: R9, R18.
 #define REGISTERS_SAVE(reg, offset) \
   MOVD R0, offset+PTRACE_R0(reg); \
   MOVD R1, offset+PTRACE_R1(reg); \
@@ -131,6 +155,12 @@
   MOVD R29, offset+PTRACE_R29(reg); \
   MOVD R30, offset+PTRACE_R30(reg);
 
+// Loads a register set.
+//
+// This is a macro because it may need to executed in contents where a stack is
+// not available for calls.
+//
+// The following registers are not loaded: R9, R18.
 #define REGISTERS_LOAD(reg, offset) \
   MOVD offset+PTRACE_R0(reg), R0; \
   MOVD offset+PTRACE_R1(reg), R1; \
@@ -162,7 +192,7 @@
   MOVD offset+PTRACE_R29(reg), R29; \
   MOVD offset+PTRACE_R30(reg), R30;
 
-//NOP
+// NOP-s
 #define nop31Instructions() \
         WORD $0xd503201f; \
         WORD $0xd503201f; \
@@ -318,6 +348,7 @@
 #define ESR_ELx_WFx_ISS_WFE	(UL(1) << 0)
 #define ESR_ELx_xVC_IMM_MASK	((1UL << 16) - 1)
 
+// LOAD_KERNEL_ADDRESS loads a kernel address.
 #define LOAD_KERNEL_ADDRESS(from, to) \
 	MOVD from, to; \
 	ORR $0xffff000000000000, to, to;
@@ -327,26 +358,23 @@
 	LOAD_KERNEL_ADDRESS(CPU_SELF(from), RSV_REG); \
 	MOVD $CPU_STACK_TOP(RSV_REG), RSV_REG; \
 	MOVD RSV_REG, RSP; \
+	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
 	ISB $15; \
 	DSB $15;
 
+// SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
 #define SWITCH_TO_APP_PAGETABLE(from) \
 	MOVD CPU_TTBR0_APP(from), RSV_REG; \
 	WORD $0xd5182012; \	//        MSR R18, TTBR0_EL1
 	ISB $15; \
 	DSB $15;
 
+// SWITCH_TO_KVM_PAGETABLE sets the kvm pagetable.
 #define SWITCH_TO_KVM_PAGETABLE(from) \
 	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
 	WORD $0xd5182012; \	//        MSR R18, TTBR0_EL1
 	ISB $15; \
 	DSB $15;
-
-#define IRQ_ENABLE \
-	MSR $2, DAIFSet;
-
-#define IRQ_DISABLE \
-	MSR $2, DAIFClr;
 
 #define VFP_ENABLE \
 	MOVD $FPEN_ENABLE, R0; \
@@ -358,6 +386,7 @@
 	WORD $0xd5181040; \ //MSR R0, CPACR_EL1
 	ISB $15;
 
+// KERNEL_ENTRY_FROM_EL0 is the entry code of the vcpu from el0 to el1.
 #define KERNEL_ENTRY_FROM_EL0 \
 	SUB $16, RSP, RSP; \		// step1, save r18, r9 into kernel temporary stack.
 	STP (RSV_REG, RSV_REG_APP), 16*0(RSP); \
@@ -379,19 +408,22 @@
 	WORD $0xd5384103; \      //  MRS SP_EL0, R3
 	MOVD R3, PTRACE_SP(RSV_REG_APP);
 
+// KERNEL_ENTRY_FROM_EL1 is the entry code of the vcpu from el1 to el1.
 #define KERNEL_ENTRY_FROM_EL1 \
 	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
-	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \	// save sentry context
+	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \	// Save sentry context.
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG); \
 	WORD $0xd5384004; \    //    MRS SPSR_EL1, R4
 	MOVD R4, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG); \
 	MRS ELR_EL1, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_PC(RSV_REG); \
 	MOVD RSP, R4; \
-	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG);
+	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG); \
+	LOAD_KERNEL_STACK(RSV_REG);  // Load the temporary stack.
 
+// Halt halts execution.
 TEXT ·Halt(SB),NOSPLIT,$0
-	// clear bluepill.
+	// Clear bluepill.
 	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
 	CMP RSV_REG, R9
 	BNE mmio_exit
@@ -402,11 +434,33 @@ mmio_exit:
 	MOVD R1, CPU_LAZY_VFP(RSV_REG)
 	VFP_DISABLE
 
-	// MMIO_EXIT.
-	MOVD $0, R9
-	MOVD R0, 0xffff000000001000(R9)
-	B ·kernelExitToEl1(SB)
+	// Trigger MMIO_EXIT/_KVM_HYPERCALL_VMEXIT.
+	//
+	// To keep it simple, I used the address of exception table as the
+	// MMIO base address, so that I can trigger a MMIO-EXIT by forcibly writing
+	// a read-only space.
+	// Also, the length is engough to match a sufficient number of hypercall ID.
+	// Then, in host user space, I can calculate this address to find out
+	// which hypercall.
+	MRS VBAR_EL1, R9
+	MOVD R0, 0x0(R9)
 
+	RET
+
+// HaltAndResume halts execution and point the pointer to the resume function.
+TEXT ·HaltAndResume(SB),NOSPLIT,$0
+	BL ·Halt(SB)
+	B ·kernelExitToEl1(SB) // Resume.
+
+// HaltEl1SvcAndResume calls Hooks.KernelSyscall and resume.
+TEXT ·HaltEl1SvcAndResume(SB),NOSPLIT,$0
+	WORD $0xd538d092            // MRS TPIDR_EL1, R18
+	MOVD CPU_SELF(RSV_REG), R3  // Load vCPU.
+	MOVD R3, 8(RSP)             // First argument (vCPU).
+	CALL ·kernelSyscall(SB)     // Call the trampoline.
+	B ·kernelExitToEl1(SB)      // Resume.
+
+// Shutdown stops the guest.
 TEXT ·Shutdown(SB),NOSPLIT,$0
 	// PSCI EVENT.
 	MOVD $0x84000009, R0
@@ -420,32 +474,129 @@ TEXT ·Current(SB),NOSPLIT,$0-8
 
 #define STACK_FRAME_SIZE 16
 
+// kernelExitToEl0 is the entrypoint for application in guest_el0.
+// Prepare the vcpu environment for container application.
 TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
+	// Step1, save sentry context into memory.
+	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS)
+	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG)
+
+	WORD $0xd5384003    //    MRS SPSR_EL1, R3
+	MOVD R3, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG)
+	MOVD R30, CPU_REGISTERS+PTRACE_PC(RSV_REG)
+	MOVD RSP, R3
+	MOVD R3, CPU_REGISTERS+PTRACE_SP(RSV_REG)
+
+	MOVD CPU_REGISTERS+PTRACE_R3(RSV_REG), R3
+
+	// Step2, save SP_EL1, PSTATE into kernel temporary stack.
+	// switch to temporary stack.
+	LOAD_KERNEL_STACK(RSV_REG)
+	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
+
+	SUB $STACK_FRAME_SIZE, RSP, RSP
+	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R11
+	MOVD CPU_REGISTERS+PTRACE_PSTATE(RSV_REG), R12
+	STP (R11, R12), 16*0(RSP)
+
+	MOVD CPU_REGISTERS+PTRACE_R11(RSV_REG), R11
+	MOVD CPU_REGISTERS+PTRACE_R12(RSV_REG), R12
+
+	// Step3, test user pagetable.
+	// If user pagetable is empty, trapped in el1_ia.
+	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
+	SWITCH_TO_APP_PAGETABLE(RSV_REG)
+	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
+	SWITCH_TO_KVM_PAGETABLE(RSV_REG)
+	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
+
+	// If pagetable is not empty, recovery kernel temporary stack.
+	ADD $STACK_FRAME_SIZE, RSP, RSP
+
+	// Step4, load app context pointer.
+	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP
+
+	// Step5, prepare the environment for container application.
+	// set sp_el0.
+	MOVD PTRACE_SP(RSV_REG_APP), R1
+	WORD $0xd5184101        //MSR R1, SP_EL0
+	// set pc.
+	MOVD PTRACE_PC(RSV_REG_APP), R1
+	MSR R1, ELR_EL1
+	// set pstate.
+	MOVD PTRACE_PSTATE(RSV_REG_APP), R1
+	WORD $0xd5184001  //MSR R1, SPSR_EL1
+
+	// RSV_REG & RSV_REG_APP will be loaded at the end.
+	REGISTERS_LOAD(RSV_REG_APP, 0)
+
+	// switch to user pagetable.
+	MOVD PTRACE_R18(RSV_REG_APP), RSV_REG
+	MOVD PTRACE_R9(RSV_REG_APP), RSV_REG_APP
+
+	SUB $STACK_FRAME_SIZE, RSP, RSP
+	STP (RSV_REG, RSV_REG_APP), 16*0(RSP)
+
+	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
+
+	SWITCH_TO_APP_PAGETABLE(RSV_REG)
+
+	LDP 16*0(RSP), (RSV_REG, RSV_REG_APP)
+	ADD $STACK_FRAME_SIZE, RSP, RSP
+
 	ERET()
 
+// kernelExitToEl1 is the entrypoint for sentry in guest_el1.
+// Prepare the vcpu environment for sentry.
 TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
+	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+
+	MOVD CPU_REGISTERS+PTRACE_PSTATE(RSV_REG), R1
+	WORD $0xd5184001  //MSR R1, SPSR_EL1
+
+	MOVD CPU_REGISTERS+PTRACE_PC(RSV_REG), R1
+	MSR R1, ELR_EL1
+
+	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R1
+	MOVD R1, RSP
+
+	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
+	MOVD CPU_REGISTERS+PTRACE_R9(RSV_REG), RSV_REG_APP
+
 	ERET()
 
+// Start is the CPU entrypoint.
 TEXT ·Start(SB),NOSPLIT,$0
-	IRQ_DISABLE
+	// Init.
+	MOVD $SCTLR_EL1_DEFAULT, R1
+	MSR R1, SCTLR_EL1
+
+	MOVD $CNTKCTL_EL1_DEFAULT, R1
+	MSR R1, CNTKCTL_EL1
+
 	MOVD R8, RSV_REG
 	ORR $0xffff000000000000, RSV_REG, RSV_REG
 	WORD $0xd518d092        //MSR R18, TPIDR_EL1
 
 	B ·kernelExitToEl1(SB)
 
+// El1_sync_invalid is the handler for an invalid EL1_sync.
 TEXT ·El1_sync_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_irq_invalid is the handler for an invalid El1_irq.
 TEXT ·El1_irq_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_fiq_invalid is the handler for an invalid El1_fiq.
 TEXT ·El1_fiq_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_error_invalid is the handler for an invalid El1_error.
 TEXT ·El1_error_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_sync is the handler for El1_sync.
 TEXT ·El1_sync(SB),NOSPLIT,$0
 	KERNEL_ENTRY_FROM_EL1
 	WORD $0xd5385219        // MRS ESR_EL1, R25
@@ -471,10 +622,20 @@ TEXT ·El1_sync(SB),NOSPLIT,$0
 	B el1_invalid
 
 el1_da:
-	B ·Halt(SB)
+	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+	WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
+
+	MOVD $0, CPU_ERROR_TYPE(RSV_REG)
+
+	MOVD $PageFault, R3
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+	B ·HaltAndResume(SB)
 
 el1_ia:
-	B ·Halt(SB)
+	B ·HaltAndResume(SB)
 
 el1_sp_pc:
 	B ·Shutdown(SB)
@@ -483,7 +644,9 @@ el1_undef:
 	B ·Shutdown(SB)
 
 el1_svc:
-	B ·Halt(SB)
+	MOVD $0, CPU_ERROR_CODE(RSV_REG)
+	MOVD $0, CPU_ERROR_TYPE(RSV_REG)
+	B ·HaltEl1SvcAndResume(SB)
 
 el1_dbg:
 	B ·Shutdown(SB)
@@ -495,15 +658,19 @@ el1_fpsimd_acc:
 el1_invalid:
 	B ·Shutdown(SB)
 
+// El1_irq is the handler for El1_irq.
 TEXT ·El1_irq(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_fiq is the handler for El1_fiq.
 TEXT ·El1_fiq(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El1_error is the handler for El1_error.
 TEXT ·El1_error(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// El0_sync is the handler for El0_sync.
 TEXT ·El0_sync(SB),NOSPLIT,$0
 	KERNEL_ENTRY_FROM_EL0
 	WORD $0xd5385219	// MRS ESR_EL1, R25
@@ -531,10 +698,31 @@ TEXT ·El0_sync(SB),NOSPLIT,$0
 	B   el0_invalid
 
 el0_svc:
-	B ·Halt(SB)
+	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+
+	MOVD $0, CPU_ERROR_CODE(RSV_REG) // Clear error code.
+
+	MOVD $1, R3
+	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
+
+	MOVD $Syscall, R3
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+	B ·HaltAndResume(SB)
 
 el0_da:
-	B ·Halt(SB)
+	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+	WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
+
+	MOVD $1, R3
+	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
+
+	MOVD $PageFault, R3
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+	B ·HaltAndResume(SB)
 
 el0_ia:
 	B ·Shutdown(SB)
@@ -567,7 +755,19 @@ TEXT ·El0_fiq(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
 TEXT ·El0_error(SB),NOSPLIT,$0
-	B ·Shutdown(SB)
+	KERNEL_ENTRY_FROM_EL0
+	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+	WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
+
+	MOVD $1, R3
+	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
+
+	MOVD $VirtualizationException, R3
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+	B ·HaltAndResume(SB)
 
 TEXT ·El0_sync_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
@@ -581,6 +781,7 @@ TEXT ·El0_fiq_invalid(SB),NOSPLIT,$0
 TEXT ·El0_error_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
+// Vectors implements exception vector table.
 TEXT ·Vectors(SB),NOSPLIT,$0
 	B ·El1_sync_invalid(SB)
 	nop31Instructions()
@@ -618,6 +819,10 @@ TEXT ·Vectors(SB),NOSPLIT,$0
 	B ·El0_error_invalid(SB)
 	nop31Instructions()
 
+	// The exception-vector-table is required to be 11-bits aligned.
+	// Please see Linux source code as reference: arch/arm64/kernel/entry.s.
+	// For gvisor, I defined it as 4K in length, filled the 2nd 2K part with NOPs.
+	// So that, I can safely move the 1st 2K part into the address with 11-bits alignment.
 	WORD $0xd503201f	//nop
 	nop31Instructions()
 	WORD $0xd503201f

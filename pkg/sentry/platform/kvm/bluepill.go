@@ -19,9 +19,9 @@ import (
 	"reflect"
 	"syscall"
 
+	"gvisor.dev/gvisor/pkg/safecopy"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
-	"gvisor.dev/gvisor/pkg/sentry/platform/safecopy"
 )
 
 // bluepill enters guest mode.
@@ -80,12 +80,6 @@ func dieHandler(c *vCPU) {
 func (c *vCPU) die(context *arch.SignalContext64, msg string) {
 	// Save the death message, which will be thrown.
 	c.dieState.message = msg
-
-	// Reload all registers to have an accurate stack trace when we return
-	// to host mode. This means that the stack should be unwound correctly.
-	if errno := c.getUserRegisters(&c.dieState.guestRegs); errno != 0 {
-		throw(msg)
-	}
 
 	// Setup the trampoline.
 	dieArchSetup(c, context, &c.dieState.guestRegs)

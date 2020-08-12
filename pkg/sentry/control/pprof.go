@@ -19,10 +19,10 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -49,6 +49,9 @@ type ProfileOpts struct {
 // - dump out the stack trace of current go routines.
 //   sentryctl -pid <pid> pprof-goroutine
 type Profile struct {
+	// Kernel is the kernel under profile. It's immutable.
+	Kernel *kernel.Kernel
+
 	// mu protects the fields below.
 	mu sync.Mutex
 
@@ -57,9 +60,6 @@ type Profile struct {
 
 	// traceFile is the current execution trace output file.
 	traceFile *fd.FD
-
-	// Kernel is the kernel under profile.
-	Kernel *kernel.Kernel
 }
 
 // StartCPUProfile is an RPC stub which starts recording the CPU profile in a
@@ -117,15 +117,43 @@ func (p *Profile) HeapProfile(o *ProfileOpts, _ *struct{}) error {
 	return nil
 }
 
-// Goroutine is an RPC stub which dumps out the stack trace for all running
-// goroutines.
-func (p *Profile) Goroutine(o *ProfileOpts, _ *struct{}) error {
+// GoroutineProfile is an RPC stub which dumps out the stack trace for all
+// running goroutines.
+func (p *Profile) GoroutineProfile(o *ProfileOpts, _ *struct{}) error {
 	if len(o.FilePayload.Files) < 1 {
 		return errNoOutput
 	}
 	output := o.FilePayload.Files[0]
 	defer output.Close()
 	if err := pprof.Lookup("goroutine").WriteTo(output, 2); err != nil {
+		return err
+	}
+	return nil
+}
+
+// BlockProfile is an RPC stub which dumps out the stack trace that led to
+// blocking on synchronization primitives.
+func (p *Profile) BlockProfile(o *ProfileOpts, _ *struct{}) error {
+	if len(o.FilePayload.Files) < 1 {
+		return errNoOutput
+	}
+	output := o.FilePayload.Files[0]
+	defer output.Close()
+	if err := pprof.Lookup("block").WriteTo(output, 0); err != nil {
+		return err
+	}
+	return nil
+}
+
+// MutexProfile is an RPC stub which dumps out the stack trace of holders of
+// contended mutexes.
+func (p *Profile) MutexProfile(o *ProfileOpts, _ *struct{}) error {
+	if len(o.FilePayload.Files) < 1 {
+		return errNoOutput
+	}
+	output := o.FilePayload.Files[0]
+	defer output.Close()
+	if err := pprof.Lookup("mutex").WriteTo(output, 0); err != nil {
 		return err
 	}
 	return nil

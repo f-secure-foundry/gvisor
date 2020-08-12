@@ -20,33 +20,36 @@ import (
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 const (
 	// maxStackDebugBytes is the maximum number of user stack bytes that may be
 	// printed by debugDumpStack.
 	maxStackDebugBytes = 1024
+	// maxCodeDebugBytes is the maximum number of user code bytes that may be
+	// printed by debugDumpCode.
+	maxCodeDebugBytes = 128
 )
 
 // Infof logs an formatted info message by calling log.Infof.
 func (t *Task) Infof(fmt string, v ...interface{}) {
 	if log.IsLogging(log.Info) {
-		log.Infof(t.logPrefix.Load().(string)+fmt, v...)
+		log.InfofAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
 }
 
 // Warningf logs a warning string by calling log.Warningf.
 func (t *Task) Warningf(fmt string, v ...interface{}) {
 	if log.IsLogging(log.Warning) {
-		log.Warningf(t.logPrefix.Load().(string)+fmt, v...)
+		log.WarningfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
 }
 
 // Debugf creates a debug string that includes the task ID.
 func (t *Task) Debugf(fmt string, v ...interface{}) {
 	if log.IsLogging(log.Debug) {
-		log.Debugf(t.logPrefix.Load().(string)+fmt, v...)
+		log.DebugfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
 }
 
@@ -61,6 +64,7 @@ func (t *Task) IsLogging(level log.Level) bool {
 func (t *Task) DebugDumpState() {
 	t.debugDumpRegisters()
 	t.debugDumpStack()
+	t.debugDumpCode()
 	if mm := t.MemoryManager(); mm != nil {
 		t.Debugf("Mappings:\n%s", mm)
 	}
@@ -108,6 +112,45 @@ func (t *Task) debugDumpStack() {
 	start &= ^usermem.Addr(15)
 	// Print 16 bytes per line, one byte at a time.
 	for offset := uint64(0); offset < maxStackDebugBytes; offset += 16 {
+		addr, ok := start.AddLength(offset)
+		if !ok {
+			break
+		}
+		var data [16]byte
+		n, err := m.CopyIn(t, addr, data[:], usermem.IOOpts{
+			IgnorePermissions: true,
+		})
+		// Print as much of the line as we can, even if an error was
+		// encountered.
+		if n > 0 {
+			t.Debugf("%x: % x", addr, data[:n])
+		}
+		if err != nil {
+			t.Debugf("Error reading stack at address %x: %v", addr+usermem.Addr(n), err)
+			break
+		}
+	}
+}
+
+// debugDumpCode logs user code contents at log level debug.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) debugDumpCode() {
+	if !t.IsLogging(log.Debug) {
+		return
+	}
+	m := t.MemoryManager()
+	if m == nil {
+		t.Debugf("Memory manager for task is gone, skipping application code dump.")
+		return
+	}
+	t.Debugf("Code:")
+	// Print code on both sides of the instruction register.
+	start := usermem.Addr(t.Arch().IP()) - maxCodeDebugBytes/2
+	// Round addr down to a 16-byte boundary.
+	start &= ^usermem.Addr(15)
+	// Print 16 bytes per line, one byte at a time.
+	for offset := uint64(0); offset < maxCodeDebugBytes; offset += 16 {
 		addr, ok := start.AddLength(offset)
 		if !ok {
 			break
@@ -198,18 +241,11 @@ func (t *Task) traceExecEvent(tc *TaskContext) {
 	if !trace.IsEnabled() {
 		return
 	}
-	d := tc.MemoryManager.Executable()
-	if d == nil {
+	file := tc.MemoryManager.Executable()
+	if file == nil {
 		trace.Logf(t.traceContext, traceCategory, "exec: << unknown >>")
 		return
 	}
-	defer d.DecRef()
-	root := t.fsContext.RootDirectory()
-	if root == nil {
-		trace.Logf(t.traceContext, traceCategory, "exec: << no root directory >>")
-		return
-	}
-	defer root.DecRef()
-	n, _ := d.FullName(root)
-	trace.Logf(t.traceContext, traceCategory, "exec: %s", n)
+	defer file.DecRef(t)
+	trace.Logf(t.traceContext, traceCategory, "exec: %s", file.PathnameWithDeleted(t))
 }

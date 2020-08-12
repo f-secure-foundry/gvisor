@@ -2,3 +2,40 @@
 
 package tun
 
+import (
+	"gvisor.dev/gvisor/pkg/state"
+)
+
+func (x *Device) StateTypeName() string {
+	return "pkg/tcpip/link/tun.Device"
+}
+
+func (x *Device) StateFields() []string {
+	return []string{
+		"Queue",
+		"endpoint",
+		"notifyHandle",
+		"flags",
+	}
+}
+
+func (x *Device) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.Queue)
+	m.Save(1, &x.endpoint)
+	m.Save(2, &x.notifyHandle)
+	m.Save(3, &x.flags)
+}
+
+func (x *Device) afterLoad() {}
+
+func (x *Device) StateLoad(m state.Source) {
+	m.Load(0, &x.Queue)
+	m.Load(1, &x.endpoint)
+	m.Load(2, &x.notifyHandle)
+	m.Load(3, &x.flags)
+}
+
+func init() {
+	state.Register((*Device)(nil))
+}

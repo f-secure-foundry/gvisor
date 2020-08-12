@@ -17,14 +17,14 @@ package gofer
 import (
 	"io"
 
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/secio"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/safemem"
 )
 
 // handles are the open handles of a gofer file. They are reference counted to
@@ -47,7 +47,8 @@ type handles struct {
 
 // DecRef drops a reference on handles.
 func (h *handles) DecRef() {
-	h.DecRefWithDestructor(func() {
+	ctx := context.Background()
+	h.DecRefWithDestructor(ctx, func(context.Context) {
 		if h.Host != nil {
 			if h.isHostBorrowed {
 				h.Host.Release()
@@ -57,8 +58,7 @@ func (h *handles) DecRef() {
 				}
 			}
 		}
-		// FIXME(b/38173783): Context is not plumbed here.
-		if err := h.File.close(context.Background()); err != nil {
+		if err := h.File.close(ctx); err != nil {
 			log.Warningf("error closing p9 file: %v", err)
 		}
 	})

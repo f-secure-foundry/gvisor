@@ -71,6 +71,8 @@ const (
 
 // Values for ICMP code as defined in RFC 792.
 const (
+	ICMPv4TTLExceeded         = 0
+	ICMPv4HostUnreachable     = 1
 	ICMPv4PortUnreachable     = 3
 	ICMPv4FragmentationNeeded = 4
 )
