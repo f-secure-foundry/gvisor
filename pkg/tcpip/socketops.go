@@ -17,6 +17,7 @@ package tcpip
 import (
 	"math"
 	"sync/atomic"
+	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -211,7 +212,7 @@ type SocketOptions struct {
 	getSendBufferLimits GetSendBufferLimits `state:"manual"`
 
 	// sendBufferSize determines the send buffer size for this socket.
-	sendBufferSize int64
+	sendBufferSize [15]byte // instead of uint64, see sendBufferSizePtr()
 
 	// mu protects the access to the below fields.
 	mu sync.Mutex `state:"nosave"`
@@ -569,7 +570,7 @@ func (so *SocketOptions) GetSendBufferSize() (int64, Error) {
 	if so.handler.IsUnixSocket() {
 		return so.handler.GetSendBufferSize()
 	}
-	return atomic.LoadInt64(&so.sendBufferSize), nil
+	return atomic.LoadInt64(so.sendBufferSizePtr()), nil
 }
 
 // SetSendBufferSize sets value for SO_SNDBUF option. notify indicates if the
@@ -602,5 +603,15 @@ func (so *SocketOptions) SetSendBufferSize(sendBufferSize int64, notify bool) {
 			v = math.MaxInt32
 		}
 	}
-	atomic.StoreInt64(&so.sendBufferSize, v)
+	atomic.StoreInt64(so.sendBufferSizePtr(), v)
+}
+
+// Required to handle:
+//  https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+//  https://github.com/golang/go/issues/599
+func (so *SocketOptions) sendBufferSizePtr() *int64 {
+	// The return must be 8-byte aligned.
+	return (*int64)(unsafe.Pointer(
+		uintptr(unsafe.Pointer(&so.sendBufferSize)) + 8 -
+		uintptr(unsafe.Pointer(&so.sendBufferSize))%8))
 }

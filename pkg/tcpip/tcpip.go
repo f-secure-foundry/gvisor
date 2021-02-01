@@ -1204,12 +1204,13 @@ type TransportProtocolNumber uint32
 type NetworkProtocolNumber uint32
 
 type StatCounter struct {
-	count [15]byte // instead of "count uint64"
+	count [15]byte // instead of uint64, see countPtr()
 }
 
-// Reference code:
-// https://go101.org/article/memory-layout.html
-func (s *StatCounter) xAddr() *uint64 {
+// Required to handle:
+//  https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+//  https://github.com/golang/go/issues/599
+func (s *StatCounter) countPtr() *uint64 {
 	// The return must be 8-byte aligned.
 	return (*uint64)(unsafe.Pointer(
 		uintptr(unsafe.Pointer(&s.count)) + 8 -
@@ -1228,12 +1229,12 @@ func (s *StatCounter) Decrement() {
 
 // Value returns the current value of the counter.
 func (s *StatCounter) Value() uint64 {
-	return atomic.LoadUint64(s.xAddr())
+	return atomic.LoadUint64(s.countPtr())
 }
 
 // IncrementBy increments the counter by v.
 func (s *StatCounter) IncrementBy(v uint64) {
-	atomic.AddUint64(s.xAddr(), v)
+	atomic.AddUint64(s.countPtr(), v)
 }
 
 func (s *StatCounter) String() string {
